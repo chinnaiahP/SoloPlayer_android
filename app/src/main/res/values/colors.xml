@@ -1,0 +1,8 @@
+<resources>
+    <color name="solo_neon_purple">#B73CFF</color>
+    <color name="solo_neon_lilac">#E0A6FF</color>
+    <color name="solo_dialog_surface">#F0141020</color>
+    <color name="solo_dialog_text">#FFF8FFFF</color>
+    <color name="solo_dialog_muted">#FFB7A9C4</color>
+    <color name="solo_dialog_stroke">#995B20A8</color>
+</resources>

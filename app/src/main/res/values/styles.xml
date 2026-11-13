@@ -1,0 +1,37 @@
+<resources>
+    <style name="SoloPlayerTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#321052</item>
+        <item name="colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorBackground">#0A0A0A</item>
+        <item name="android:windowBackground">#0A0A0A</item>
+        <item name="android:colorControlActivated">@color/solo_neon_purple</item>
+        <item name="android:colorControlHighlight">#557B2DFF</item>
+        <item name="android:statusBarColor">#0A0A0A</item>
+        <item name="android:navigationBarColor">#0A0A0A</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:alertDialogTheme">@style/SoloPlayerDialog</item>
+    </style>
+
+    <style name="SoloCastButtonTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#321052</item>
+        <item name="colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorBackground">#0A0A0A</item>
+        <item name="android:windowBackground">#0A0A0A</item>
+    </style>
+
+    <style name="SoloPlayerDialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="colorPrimary">#321052</item>
+        <item name="colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorAccent">@color/solo_neon_purple</item>
+        <item name="android:colorControlActivated">@color/solo_neon_purple</item>
+        <item name="android:colorControlHighlight">#667B2DFF</item>
+        <item name="android:colorBackground">@color/solo_dialog_surface</item>
+        <item name="android:windowBackground">@drawable/solo_dialog_background</item>
+        <item name="android:textColorPrimary">@color/solo_dialog_text</item>
+        <item name="android:textColorSecondary">@color/solo_dialog_muted</item>
+        <item name="android:windowMinWidthMajor">86%</item>
+        <item name="android:windowMinWidthMinor">90%</item>
+    </style>
+</resources>

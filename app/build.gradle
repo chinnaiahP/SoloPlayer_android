@@ -1,0 +1,45 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.soloplayer.android'
+    compileSdk 33
+    defaultConfig {
+        applicationId 'com.soloplayer.android'
+        minSdk 24
+        targetSdk 33
+        versionCode 9
+        versionName '1.2.6'
+    }
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+            universalApk true
+        }
+    }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+    }
+}
+dependencies {
+    implementation 'org.videolan.android:libvlc-all:3.4.9'
+    implementation 'com.google.android.gms:play-services-cast-framework:21.0.1'
+    implementation 'androidx.biometric:biometric:1.1.0'
+    implementation 'androidx.appcompat:appcompat:1.2.0'
+}
+
+
+
+
+
+
+
+
