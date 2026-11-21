@@ -301,6 +301,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    };
    private boolean resumeAfterFocusLoss = false;
    private boolean pausedForInterruption = false;
+   private boolean duckedForFocus = false;
    private boolean activityStarted = false;
    private int decoderMode = 0;
    private FrameLayout fullscreenContainer;
@@ -4476,6 +4477,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.prefs().edit().putBoolean("background_audio_enabled", enabled).apply();
       if (!enabled) AudioPlaybackService.stop(this.getApplicationContext());
       this.toast(enabled ? "Background audio enabled" : "Background audio disabled");
+      if (this.page.equals("Settings")) this.render();
    }
 
    private float[] presetGains(String preset, boolean video, int count) {
@@ -5783,7 +5785,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          if (VERSION.SDK_INT >= 26) {
             if (this.audioFocusRequest == null) {
                AudioAttributes attrs = (new AudioAttributes.Builder()).setUsage(1).setContentType(3).build();
-               this.audioFocusRequest = (new AudioFocusRequest.Builder(1)).setAudioAttributes(attrs).setOnAudioFocusChangeListener(this.focusListener, this.handler).setWillPauseWhenDucked(true).build();
+               this.audioFocusRequest = (new AudioFocusRequest.Builder(1)).setAudioAttributes(attrs).setOnAudioFocusChangeListener(this.focusListener, this.handler).setWillPauseWhenDucked(false).build();
             }
 
             result = this.audioManager.requestAudioFocus(this.audioFocusRequest);
@@ -5804,32 +5806,53 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
       }
 
+      if (this.duckedForFocus) {
+         this.duckedForFocus = false;
+         if (this.player != null) {
+            try {
+               this.player.setVolume(100);
+            } catch (Exception ignored) {}
+         }
+      }
+
       this.resumeAfterFocusLoss = false;
    }
 
    private void handleAudioFocus(int focus) {
       if (this.player != null) {
-         if (focus != -2 && focus != -3) {
-            if (focus == -1) {
-               this.pausedForInterruption = false;
-               this.resumeAfterFocusLoss = false;
-               if (this.player.isPlaying()) {
-                  this.player.pause();
-               }
-            } else if (focus == 1) {
-               this.pausedForInterruption = false;
-               if (this.resumeAfterFocusLoss && this.player.hasMedia() && this.activityStarted) {
-                  this.player.play();
-               }
-
-               this.resumeAfterFocusLoss = false;
-            }
-         } else {
+         if (focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+            // A notification or other short sound is playing — dip the volume
+            // instead of pausing so background music keeps going.
+            this.duckedForFocus = true;
+            try {
+               this.player.setVolume(25);
+            } catch (Exception ignored) {}
+         } else if (focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
             this.pausedForInterruption = true;
             this.resumeAfterFocusLoss = this.player.isPlaying();
             if (this.resumeAfterFocusLoss) {
                this.player.pause();
             }
+         } else if (focus == AudioManager.AUDIOFOCUS_LOSS) {
+            this.duckedForFocus = false;
+            this.pausedForInterruption = false;
+            this.resumeAfterFocusLoss = false;
+            if (this.player.isPlaying()) {
+               this.player.pause();
+            }
+         } else if (focus == AudioManager.AUDIOFOCUS_GAIN) {
+            if (this.duckedForFocus) {
+               try {
+                  this.player.setVolume(100);
+               } catch (Exception ignored) {}
+               this.duckedForFocus = false;
+            }
+            this.pausedForInterruption = false;
+            if (this.resumeAfterFocusLoss && this.player.hasMedia() && this.activityStarted) {
+               this.player.play();
+            }
+
+            this.resumeAfterFocusLoss = false;
          }
 
          this.updateMini();
