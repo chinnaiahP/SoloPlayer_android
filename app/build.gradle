@@ -1,13 +1,17 @@
 plugins { id 'com.android.application' }
 android {
     namespace 'com.soloplayer.android'
-    compileSdk 33
+    compileSdk 35
     defaultConfig {
         applicationId 'com.soloplayer.android'
         minSdk 24
-        targetSdk 33
+        targetSdk 35
         versionCode 9
         versionName '1.2.6'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
     splits {
         abi {
@@ -30,8 +34,8 @@ android {
     }
 }
 dependencies {
-    implementation 'org.videolan.android:libvlc-all:3.4.9'
-    implementation 'com.google.android.gms:play-services-cast-framework:21.0.1'
+    implementation 'org.videolan.android:libvlc-all:3.6.5'
+    implementation 'com.google.android.gms:play-services-cast-framework:21.5.0'
     implementation 'androidx.biometric:biometric:1.1.0'
     implementation 'androidx.appcompat:appcompat:1.2.0'
 }

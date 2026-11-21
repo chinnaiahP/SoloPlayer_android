@@ -5,10 +5,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -23,10 +26,13 @@ public final class AudioPlaybackService extends Service {
     private static final String ACTION_UPDATE = "com.soloplayer.android.audio.UPDATE";
     private static final String ACTION_TOGGLE = "com.soloplayer.android.audio.TOGGLE";
     private static final String ACTION_STOP = "com.soloplayer.android.audio.STOP";
+    private static final String ACTION_NEXT = "com.soloplayer.android.audio.NEXT";
+    private static final String ACTION_PREVIOUS = "com.soloplayer.android.audio.PREVIOUS";
     private MediaSession mediaSession;
     private Bitmap notificationIcon;
     private String title = "Solo Player";
     private boolean requestedPlaying;
+    private BroadcastReceiver noisyReceiver;
 
     static void startOrUpdate(Context context, String title, boolean playing) {
         Intent intent = new Intent(context, AudioPlaybackService.class).setAction(ACTION_UPDATE)
@@ -47,9 +53,17 @@ public final class AudioPlaybackService extends Service {
         mediaSession.setCallback(new MediaSession.Callback() {
             @Override public void onPlay() { setPlaying(true); }
             @Override public void onPause() { setPlaying(false); }
-            @Override public void onStop() { stopAudio(); }
+            @Override public void onStop() { setPlaying(false); }
+            @Override public void onSkipToNext() { MainActivity.skipRetainedAdjacent(1); }
+            @Override public void onSkipToPrevious() { MainActivity.skipRetainedAdjacent(-1); }
         });
         mediaSession.setActive(true);
+        noisyReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) setPlaying(false);
+            }
+        };
+        registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -63,6 +77,10 @@ public final class AudioPlaybackService extends Service {
             MediaPlayer player = MainActivity.retainedPlayer();
             boolean playing = player != null && (player.isPlaying() || MainActivity.retainedPlaybackRequested());
             setPlaying(!playing);
+        } else if (intent != null && ACTION_NEXT.equals(intent.getAction())) {
+            MainActivity.skipRetainedAdjacent(1);
+        } else if (intent != null && ACTION_PREVIOUS.equals(intent.getAction())) {
+            MainActivity.skipRetainedAdjacent(-1);
         } else if (intent != null) {
             title = intent.getStringExtra("title");
             requestedPlaying = intent.getBooleanExtra("playing", false);
@@ -71,6 +89,14 @@ public final class AudioPlaybackService extends Service {
         startForeground(NOTIFICATION_ID, buildNotification());
         publishSessionState();
         return START_STICKY;
+    }
+
+    /** App swiped away from recents — release everything so nothing lingers. */
+    @Override public void onTaskRemoved(Intent rootIntent) {
+        stopAudio();
+        stopForeground(true);
+        stopSelf();
+        super.onTaskRemoved(rootIntent);
     }
 
     private void setPlaying(boolean playing) {
@@ -95,6 +121,7 @@ public final class AudioPlaybackService extends Service {
 
     private void publishSessionState() {
         if (mediaSession == null) return;
+        mediaSession.setActive(true);
         mediaSession.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, "Solo Player")
                 .putBitmap(MediaMetadata.METADATA_KEY_ART, getNotificationIcon())
@@ -102,7 +129,8 @@ public final class AudioPlaybackService extends Service {
         MediaPlayer player = MainActivity.retainedPlayer();
         boolean playing = player != null && (player.isPlaying() || requestedPlaying);
         long position = player != null && player.hasMedia() ? player.getTime() : 0L;
-        long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_STOP;
+        long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
+                | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_STOP;
         mediaSession.setPlaybackState(new PlaybackState.Builder().setActions(actions)
                 .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED, position, 1.0f).build());
     }
@@ -112,14 +140,23 @@ public final class AudioPlaybackService extends Service {
         boolean playing = player != null && (player.isPlaying() || requestedPlaying);
         Intent toggleIntent = new Intent(this, AudioPlaybackService.class).setAction(ACTION_TOGGLE);
         PendingIntent toggle = PendingIntent.getService(this, 1, toggleIntent, pendingFlags());
+        Intent previousIntent = new Intent(this, AudioPlaybackService.class).setAction(ACTION_PREVIOUS);
+        PendingIntent previous = PendingIntent.getService(this, 3, previousIntent, pendingFlags());
+        Intent nextIntent = new Intent(this, AudioPlaybackService.class).setAction(ACTION_NEXT);
+        PendingIntent next = PendingIntent.getService(this, 4, nextIntent, pendingFlags());
+        Intent stopIntent = new Intent(this, AudioPlaybackService.class).setAction(ACTION_STOP);
+        PendingIntent stop = PendingIntent.getService(this, 5, stopIntent, pendingFlags());
         Intent openIntent = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent open = PendingIntent.getActivity(this, 2, openIntent, pendingFlags());
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
         builder.setSmallIcon(android.R.drawable.ic_media_play).setLargeIcon(getNotificationIcon()).setContentTitle(title).setContentText("Solo Player · Audio")
-                .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
+                .setContentIntent(open).setOngoing(playing).setOnlyAlertOnce(true)
+                .addAction(android.R.drawable.ic_media_previous, "Previous", previous)
                 .addAction(playing ? R.drawable.pause_icon : android.R.drawable.ic_media_play,
-                        playing ? "Pause" : "Play", toggle);
-        if (mediaSession != null) builder.setStyle(new Notification.MediaStyle().setMediaSession(mediaSession.getSessionToken()).setShowActionsInCompactView(0));
+                        playing ? "Pause" : "Play", toggle)
+                .addAction(android.R.drawable.ic_media_next, "Next", next)
+                .addAction(android.R.drawable.ic_delete, "Stop", stop);
+        if (mediaSession != null) builder.setStyle(new Notification.MediaStyle().setMediaSession(mediaSession.getSessionToken()).setShowActionsInCompactView(0, 1, 2));
         return builder.build();
     }
 
@@ -148,6 +185,10 @@ public final class AudioPlaybackService extends Service {
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public void onDestroy() {
+        if (noisyReceiver != null) {
+            try { unregisterReceiver(noisyReceiver); } catch (Exception ignored) {}
+            noisyReceiver = null;
+        }
         if (mediaSession != null) { mediaSession.setActive(false); mediaSession.release(); mediaSession = null; }
         super.onDestroy();
     }

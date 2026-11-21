@@ -13,6 +13,7 @@ public final class AudioArtworkEffectView extends View {
     private final int purple;
     private final int lilac;
     private boolean playing;
+    private boolean showBars = true;
 
     public AudioArtworkEffectView(Context context, int purple, int lilac) {
         super(context);
@@ -28,12 +29,18 @@ public final class AudioArtworkEffectView extends View {
         invalidate();
     }
 
+    public void setShowBars(boolean value) {
+        if (this.showBars == value) return;
+        this.showBars = value;
+        invalidate();
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         float width = getWidth(), height = getHeight();
         if (width <= 0 || height <= 0) return;
         float phase = playing ? android.os.SystemClock.uptimeMillis() / 1000.0f : 0.0f;
-        float cx = width * 0.5f, cy = height * 0.405f;
+        float cx = width * 0.5f, cy = height * (showBars ? 0.405f : 0.5f);
         float base = Math.min(width * 0.35f, height * 0.325f);
         for (int layer = 0; layer < 3; layer++) {
             Path wave = new Path();
@@ -66,6 +73,7 @@ public final class AudioArtworkEffectView extends View {
         canvas.drawCircle(cx + (float) Math.cos(dotAngle) * dotRadius,
                 cy + (float) Math.sin(dotAngle) * dotRadius, dp(3.5f), paint);
 
+        if (showBars) {
         int bars = 17;
         float gap = dp(3), available = width * 0.78f;
         float barWidth = (available - gap * (bars - 1)) / bars;
@@ -84,6 +92,7 @@ public final class AudioArtworkEffectView extends View {
             paint.setAlpha(playing ? 220 : 82);
             canvas.drawRoundRect(new RectF(x, baseline - barHeight, x + barWidth, baseline),
                     dp(2), dp(2), paint);
+        }
         }
         if (playing) postInvalidateDelayed(48L);
     }

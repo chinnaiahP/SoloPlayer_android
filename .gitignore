@@ -1,0 +1,55 @@
+# ============================================
+#  SOLO Player Android — .gitignore
+# ============================================
+
+# ---------- Gradle ----------
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ---------- IDE (Android Studio / IntelliJ) ----------
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# ---------- Local config (contains YOUR SDK path) ----------
+local.properties
+
+# ---------- Signing / Keystore ----------
+*.jks
+*.keystore
+signing.properties
+
+# ---------- Generated / Compiled ----------
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+
+# ---------- Native (C/C++ builds) ----------
+.cxx/
+obj/
+*.so
+*.o
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# ---------- Logs & Crash reports ----------
+*.log
+captures/
+
+# ---------- Misc ----------
+*.hprof
+.externalNativeBuild/
+.navigation/
+

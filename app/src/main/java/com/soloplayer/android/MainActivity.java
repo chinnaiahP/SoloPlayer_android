@@ -7,8 +7,10 @@ import android.app.Dialog;
 import android.app.KeyguardManager;
 import android.app.PictureInPictureParams;
 import android.app.PendingIntent;
+import android.app.ProgressDialog;
 import android.app.RemoteAction;
 import android.content.Context;
+import android.content.ContentValues;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -25,6 +27,7 @@ import android.graphics.drawable.Icon;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.RippleDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -52,12 +55,16 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.WindowManager;
+import android.view.KeyEvent;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextWatcher;
+import android.text.TextUtils;
 import android.text.style.ImageSpan;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -76,7 +83,10 @@ import com.soloplayer.android.data.library.MediaLibraryRepository;
 import com.soloplayer.android.model.MediaItem;
 import com.soloplayer.android.data.repository.StreamBookmarkRepository;
 import com.soloplayer.android.streaming.M3uPlaylistParser;
+import com.soloplayer.android.online.OnlineArtwork;
+import com.soloplayer.android.online.OnlineMusicService;
 import com.soloplayer.android.ui.player.AudioArtworkEffectView;
+import com.soloplayer.android.ui.player.WaveformSeekView;
 import java.io.BufferedReader;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -109,6 +119,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -123,6 +135,10 @@ import org.videolan.libvlc.util.DisplayManager;
 import org.videolan.libvlc.util.VLCVideoLayout;
 import androidx.biometric.BiometricPrompt;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
 import com.google.android.gms.cast.MediaInfo;
 import com.google.android.gms.cast.MediaLoadRequestData;
 import com.google.android.gms.cast.MediaMetadata;
@@ -145,12 +161,12 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends androidx.fragment.app.FragmentActivity {
-   private static final int BG = Color.rgb(10, 10, 10);
-   private static final int PANEL = Color.rgb(24, 24, 24);
-   private static final int CARD = Color.rgb(34, 34, 34);
+   private static final int BG = Color.rgb(9, 8, 13);
+   private static final int PANEL = Color.rgb(20, 16, 28);
+   private static final int CARD = Color.rgb(32, 26, 42);
    private static final int PURPLE = Color.rgb(157, 65, 255);
    private static final int LILAC = Color.rgb(207, 142, 255);
-   private static final int MUTED = Color.rgb(156, 156, 156);
+   private static final int MUTED = Color.rgb(170, 158, 182);
    private static final int GREEN = Color.rgb(66, 220, 150);
    private static final int PICK_MEDIA = 10;
    private static final int PICK_FOLDER = 11;
@@ -160,9 +176,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private static final int PICK_VAULT_FILES = 15;
    private static final int PICK_VAULT_FOLDER = 19;
    private static final int MOVE_PRIVATE_MEDIA = 20;
+   private static final int PICK_CUT_DESTINATION = 21;
+   private static final int CONFIRM_MEDIA_DELETE = 22;
+   private static final int REQUEST_STORAGE_DELETE_PERMISSION = 78;
+   private static final int REQUEST_POST_NOTIFICATIONS = 79;
    private static final int UNLOCK_PRIVATE_VAULT = 16;
    private static final int RESET_PRIVATE_VAULT_PIN = 18;
    private final ArrayList<MediaItem> library = new ArrayList();
+   private final LinkedHashSet<String> selectedMediaUris = new LinkedHashSet<>();
+   private final ArrayList<MediaItem> pendingFileOperationItems = new ArrayList<>();
+   private final ArrayList<Uri> pendingCutCopies = new ArrayList<>();
+   private boolean mediaSelectionMode = false;
+   private boolean pendingCutDelete = false;
+   private int pendingLegacyDeleteIndex = 0;
    private MediaLibraryRepository mediaLibraryRepository;
    private static final ArrayList<MediaItem> queue = new ArrayList();
    private final ArrayList<MediaItem> channels = new ArrayList();
@@ -215,6 +241,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private long pausedFramePosition = -1L;
    private boolean pausedFrameTransitionInProgress = false;
    private boolean pendingAutoFullscreen = false;
+   private int openPlayerRetries = 0;
    private ImageView fullscreenArtwork;
    private AudioArtworkEffectView fullscreenArtworkEffect;
    private FrameLayout videoFrame;
@@ -248,8 +275,10 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private SeekBar playbackSeek;
    private boolean seeking = false;
    private boolean permissionRequestInFlight = false;
+   private boolean notificationPermissionPrompted = false;
    private boolean softwareDecode = false;
    private boolean fullscreen = false;
+   private boolean gestureSidesSwapped = false;
    private boolean videoSurfaceAttached = false;
    private boolean videoRebindPending = false;
    private String orientationMode = "Adaptive";
@@ -318,7 +347,18 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private int gestureVolume = 100;
    private TextView fullscreenTitle; private TextView landscapeRatioButton;
    private TextView fullscreenTime;
-   private SeekBar fullscreenSeek;
+   private TextView fullscreenDuration;
+   private TextView fullscreenArtist;
+   private WaveformSeekView fullscreenSeek;
+   private SeekBar fullscreenVideoSeek;
+   private ImageView fullscreenAmbient;
+   private TextView fullscreenHeaderTitle;
+   private TextView fullscreenHeaderArtist;
+   private TextView fullscreenRepeatButton;
+   private com.soloplayer.android.ui.player.AudioWaveBackdropView audioWaveBackdrop;
+   private int repeatMode = 0; // 0 off, 1 repeat all, 2 repeat one
+   private TextView fullscreenShuffleButton;
+   private boolean shuffleEnabled = false;
    private String aspectMode = "Best fit";
    private String videoPreset = "Standard";
    private String audioPreset = "Standard";
@@ -401,6 +441,52 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private String page = "Home";
    private String previousPage = "Home";
    private String renderedPage = "";
+   private final java.util.ArrayDeque<NavState> navBackStack = new java.util.ArrayDeque<>();
+   private NavState lastNavState = null;
+   private boolean navRestoring = false;
+   private android.media.session.MediaSession mediaSession;
+   private android.content.BroadcastReceiver becomingNoisyReceiver;
+   private long lastOnlineRetryAt = 0L;
+
+   /** Snapshot of the fields that decide which page/sub-page is rendered, so Back
+    * can return to the exact previous screen instead of jumping to a fixed tab. */
+   private final class NavState {
+      final String page, musicMode, onlineView, onlineDetailTitle, activeFolder,
+            activePlaylist, folderReturnPage, mediaFilter, searchQuery;
+      final boolean browsingAudioFolders;
+
+      NavState() {
+         this.page = MainActivity.this.page;
+         this.musicMode = MainActivity.this.musicMode;
+         this.onlineView = MainActivity.this.onlineView;
+         this.onlineDetailTitle = MainActivity.this.onlineDetailTitle;
+         this.activeFolder = MainActivity.this.activeFolder;
+         this.activePlaylist = MainActivity.this.activePlaylist;
+         this.folderReturnPage = MainActivity.this.folderReturnPage;
+         this.mediaFilter = MainActivity.this.mediaFilter;
+         this.searchQuery = MainActivity.this.searchQuery;
+         this.browsingAudioFolders = MainActivity.this.browsingAudioFolders;
+      }
+
+      String key() {
+         return this.page + "|" + this.musicMode + "|" + this.onlineView + "|" + this.onlineDetailTitle + "|"
+               + this.activeFolder + "|" + this.activePlaylist + "|" + this.folderReturnPage + "|"
+               + this.mediaFilter + "|" + this.searchQuery + "|" + this.browsingAudioFolders;
+      }
+
+      void restore() {
+         MainActivity.this.page = this.page;
+         MainActivity.this.musicMode = this.musicMode;
+         MainActivity.this.onlineView = this.onlineView;
+         MainActivity.this.onlineDetailTitle = this.onlineDetailTitle;
+         MainActivity.this.activeFolder = this.activeFolder;
+         MainActivity.this.activePlaylist = this.activePlaylist;
+         MainActivity.this.folderReturnPage = this.folderReturnPage;
+         MainActivity.this.mediaFilter = this.mediaFilter;
+         MainActivity.this.searchQuery = this.searchQuery;
+         MainActivity.this.browsingAudioFolders = this.browsingAudioFolders;
+      }
+   }
    private String activeFolder = "";
    private String activePlaylist = "Favorites";
    private String pendingPlaylistName = "";
@@ -409,6 +495,24 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private boolean libraryScanInFlight = false;
    private String mediaFilter = "All";
    private String musicMode = "Songs";
+   private OnlineMusicService onlineService = null;
+   private final ExecutorService onlineWorker = Executors.newFixedThreadPool(3);
+   private final LinkedHashMap<String, String> onlineResolvedUrls = new LinkedHashMap<String, String>();
+   private ArrayList<OnlineMusicService.OnlineShelf> onlineShelves = new ArrayList<>();
+   private ArrayList<OnlineMusicService.OnlineMood> onlineMoods = new ArrayList<>();
+   private ArrayList<OnlineMusicService.OnlineTrack> onlineSearchResults = null;
+   private boolean onlineHomeRequested = false;
+   private boolean onlineLoading = false;
+   private boolean onlineSearching = false;
+   private long onlineSearchToken = 0L;
+   private LinearLayout onlineSearchBar;
+   private EditText onlineSearchField;
+   private String onlineError = "";
+   private String onlineSearchQuery = "";
+   private String onlineView = "home";
+   private String onlineDetailTitle = "";
+   private ArrayList<OnlineMusicService.OnlineTrack> onlineDetailTracks = new ArrayList<>();
+   private ArrayList<OnlineMusicService.OnlineShelf> onlineDetailShelves = new ArrayList<>();
    private String streamAgent = "";
    private String streamReferer = "";
    private String searchQuery = ""; private String networkSearchQuery = "";
@@ -451,6 +555,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
 
    public void onCreate(Bundle state) {
       super.onCreate(state);
+      WindowCompat.setDecorFitsSystemWindows(this.getWindow(), false);
       this.getWindow().setStatusBarColor(BG);
       this.getWindow().setNavigationBarColor(BG);
       this.getWindow().setSoftInputMode(16);
@@ -464,6 +569,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.audioDelayMs = this.prefs().getInt("audio_delay_ms", 0);
       this.subtitleDelayMs = this.prefs().getInt("subtitle_delay_ms", 0);
       this.backgroundAudioEnabled = this.prefs().getBoolean("background_audio_enabled", true);
+      this.gestureSidesSwapped = this.prefs().getBoolean("gesture_sides_swapped", false);
       try { this.privateVideos = new JSONArray(this.prefs().getString("private_media", this.prefs().getString("private_videos", "[]"))); } catch (Exception ignored) { this.privateVideos = new JSONArray(); }
       this.aspectMode = this.prefs().getString("aspect_mode", "Best fit");
       if (!Arrays.asList("Fit screen", "Center", "16:9", "Fill", "Best fit", "4:3", "16:10", "1:1", "2.35:1", "Original", "Crop", "Maximize", "Fit").contains(this.aspectMode)) this.aspectMode = "Best fit";
@@ -495,7 +601,116 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          });
       }
 
+      this.initMediaSession();
       this.ensureMediaPermission();
+   }
+
+   /** MediaSession so wired-headset and Bluetooth AVRCP buttons
+    * (play/pause/next/previous/seek) work for every media type. */
+   private void initMediaSession() {
+      this.mediaSession = new android.media.session.MediaSession(this, "SoloPlayer");
+      this.mediaSession.setFlags(android.media.session.MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
+            | android.media.session.MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+      this.mediaSession.setCallback(new android.media.session.MediaSession.Callback() {
+         @Override public void onPlay() { MainActivity.this.mediaButtonPlay(); }
+         @Override public void onPause() { MainActivity.this.mediaButtonPause(); }
+         @Override public void onSkipToNext() { MainActivity.this.playAdjacent(1); }
+         @Override public void onSkipToPrevious() { MainActivity.this.playAdjacent(-1); }
+         @Override public void onFastForward() { MainActivity.this.seekBy(10000L); }
+         @Override public void onRewind() { MainActivity.this.seekBy(-10000L); }
+         @Override public void onSeekTo(long pos) {
+            if (MainActivity.this.player != null && MainActivity.this.player.hasMedia()) {
+               MainActivity.this.player.setTime(Math.max(0L, pos));
+               MainActivity.this.updatePlaybackTime();
+            }
+         }
+         @Override public void onStop() { MainActivity.this.mediaButtonPause(); }
+         @Override public boolean onMediaButtonEvent(Intent intent) {
+            if (intent == null || !Intent.ACTION_MEDIA_BUTTON.equals(intent.getAction())) return false;
+            android.view.KeyEvent event = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
+            if (event == null || event.getAction() != android.view.KeyEvent.ACTION_DOWN) return false;
+            switch (event.getKeyCode()) {
+               case android.view.KeyEvent.KEYCODE_MEDIA_PLAY: this.onPlay(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_PAUSE: this.onPause(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE: MainActivity.this.togglePlayback(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_NEXT: this.onSkipToNext(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS: this.onSkipToPrevious(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD: this.onFastForward(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_REWIND: this.onRewind(); return true;
+               case android.view.KeyEvent.KEYCODE_MEDIA_STOP: this.onStop(); return true;
+               default: return false;
+            }
+         }
+      });
+   }
+
+   private void mediaButtonPlay() {
+      if (this.player != null && this.player.hasMedia() && !this.isPlaybackActive() && this.requestPlaybackFocus()) {
+         playbackRequested = true;
+         this.player.play();
+      }
+      this.syncPlaybackUi();
+   }
+
+   private void mediaButtonPause() {
+      if (this.player != null && this.player.hasMedia() && this.isPlaybackActive()) {
+         playbackRequested = false;
+         playbackStartPending = false;
+         this.player.pause();
+      }
+      this.syncPlaybackUi();
+   }
+
+   /** Publishes playback state + metadata to the media session so headsets,
+    * car head-units and Bluetooth devices show the right info and controls. */
+   private void publishMediaSessionState() {
+      if (this.mediaSession == null) return;
+      boolean hasMedia = this.player != null && this.player.hasMedia();
+      if (!hasMedia && this.current == null) {
+         this.mediaSession.setPlaybackState(new android.media.session.PlaybackState.Builder()
+               .setState(android.media.session.PlaybackState.STATE_NONE, 0L, 1.0f).build());
+         return;
+      }
+      long actions = android.media.session.PlaybackState.ACTION_PLAY
+            | android.media.session.PlaybackState.ACTION_PAUSE
+            | android.media.session.PlaybackState.ACTION_PLAY_PAUSE
+            | android.media.session.PlaybackState.ACTION_SKIP_TO_NEXT
+            | android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS
+            | android.media.session.PlaybackState.ACTION_FAST_FORWARD
+            | android.media.session.PlaybackState.ACTION_REWIND
+            | android.media.session.PlaybackState.ACTION_SEEK_TO
+            | android.media.session.PlaybackState.ACTION_STOP;
+      int state = playbackStartPending ? android.media.session.PlaybackState.STATE_BUFFERING
+            : this.isPlaybackActive() ? android.media.session.PlaybackState.STATE_PLAYING
+            : android.media.session.PlaybackState.STATE_PAUSED;
+      this.mediaSession.setPlaybackState(new android.media.session.PlaybackState.Builder()
+            .setActions(actions).setState(state, this.activePlaybackTime(), 1.0f).build());
+      if (this.current != null) {
+         android.media.MediaMetadata.Builder meta = new android.media.MediaMetadata.Builder()
+               .putString(android.media.MediaMetadata.METADATA_KEY_TITLE, this.current.name)
+               .putString(android.media.MediaMetadata.METADATA_KEY_ARTIST,
+                     this.current.artist == null || this.current.artist.isEmpty() ? "Solo Player" : this.current.artist)
+               .putLong(android.media.MediaMetadata.METADATA_KEY_DURATION, this.activePlaybackLength());
+         if (this.current.album != null && !this.current.album.isEmpty())
+            meta.putString(android.media.MediaMetadata.METADATA_KEY_ALBUM, this.current.album);
+         this.mediaSession.setMetadata(meta.build());
+      }
+   }
+
+   private void registerBecomingNoisyReceiver() {
+      if (this.becomingNoisyReceiver != null) return;
+      this.becomingNoisyReceiver = new android.content.BroadcastReceiver() {
+         @Override public void onReceive(Context context, Intent intent) {
+            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) MainActivity.this.mediaButtonPause();
+         }
+      };
+      this.registerReceiver(this.becomingNoisyReceiver, new android.content.IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
+   }
+
+   private void unregisterBecomingNoisyReceiver() {
+      if (this.becomingNoisyReceiver == null) return;
+      try { this.unregisterReceiver(this.becomingNoisyReceiver); } catch (Exception ignored) {}
+      this.becomingNoisyReceiver = null;
    }
 
    private SharedPreferences prefs() {
@@ -509,12 +724,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       return d;
    }
 
+   private Drawable touchSurface(int color, int radius) {
+      return new RippleDrawable(ColorStateList.valueOf(Color.argb(50, 207, 142, 255)), this.shape(color, radius), null);
+   }
+
    private TextView compactButton(String s, boolean primary) {
       TextView t = this.text(s, 13, -1, true);
       t.setGravity(17);
       t.setPadding(this.dp(8.0F), this.dp(6.0F), this.dp(8.0F), this.dp(6.0F));
-      t.setMinHeight(this.dp(42.0F));
-      t.setBackground(this.shape(primary ? PURPLE : CARD, 13));
+      t.setMinWidth(this.dp(48.0F));
+      t.setMinHeight(this.dp(48.0F));
+      t.setSingleLine(true);
+      t.setEllipsize(TextUtils.TruncateAt.END);
+      t.setBackground(this.touchSurface(primary ? PURPLE : CARD, 13));
       return t;
    }
 
@@ -534,6 +756,11 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private LinearLayout col() {
       LinearLayout l = new LinearLayout(this);
       l.setOrientation(1);
+      GradientDrawable gap = new GradientDrawable();
+      gap.setColor(Color.TRANSPARENT);
+      gap.setSize(this.dp(1), this.dp(3));
+      l.setDividerDrawable(gap);
+      l.setShowDividers(LinearLayout.SHOW_DIVIDER_MIDDLE);
       return l;
    }
 
@@ -552,18 +779,24 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       TextView t = this.text(s, 14, -1, true);
       t.setGravity(17);
       t.setPadding(this.dp(13.0F), this.dp(10.0F), this.dp(13.0F), this.dp(10.0F));
-      t.setBackground(this.shape(primary ? PURPLE : CARD, 15));
+      t.setMinHeight(this.dp(48.0F));
+      t.setBackground(this.touchSurface(primary ? PURPLE : CARD, 15));
       return t;
    }
 
    private void buildShell() {
       this.root = this.col();
       this.root.setBackgroundColor(BG);
+      ViewCompat.setOnApplyWindowInsetsListener(this.root, (view, windowInsets) -> {
+         Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
+         view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+         return windowInsets;
+      });
       this.setContentView(this.root);
       this.toolbar = this.row();
-      this.toolbar.setPadding(this.dp(10.0F), this.dp(7.0F), this.dp(10.0F), this.dp(7.0F));
+      this.toolbar.setPadding(this.dp(8.0F), this.dp(5.0F), this.dp(8.0F), this.dp(5.0F));
       TextView menu = this.compactButton("☰", false);
-      this.toolbar.addView(menu, this.lp(this.dp(38.0F), this.dp(40.0F)));
+      this.toolbar.addView(menu, this.lp(this.dp(48.0F), this.dp(48.0F)));
       menu.setOnClickListener((v) -> {
          this.page = "More";
          this.render();
@@ -575,6 +808,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       ilp.leftMargin = this.dp(4.0F);
       this.toolbar.addView(icon, ilp);
       this.pageTitle = this.text("SOLO Player", 16, PURPLE, true);
+      this.pageTitle.setSingleLine(true);
+      this.pageTitle.setEllipsize(TextUtils.TruncateAt.END);
       LinearLayout.LayoutParams titleLp = this.lp(0, -2);
       titleLp.weight = 1.0F;
       titleLp.leftMargin = this.dp(5.0F);
@@ -582,14 +817,16 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       TextView search = this.compactButton("⌕", false);
       TextView pip = this.compactButton("▣", false);
       pip.setContentDescription("Open floating video window");
-      this.toolbar.addView(search, this.lp(this.dp(38.0F), this.dp(40.0F)));
+      this.toolbar.addView(search, this.lp(this.dp(48.0F), this.dp(48.0F)));
       MediaRouteButton homeCast = this.createCastButton();
-      this.toolbar.addView(homeCast, this.lp(this.dp(42.0F), this.dp(40.0F)));
+      LinearLayout.LayoutParams castLp = this.lp(this.dp(48.0F), this.dp(48.0F));
+      castLp.leftMargin = this.dp(6.0F);
+      this.toolbar.addView(homeCast, castLp);
       search.setOnClickListener((v) -> {
          this.searchDialog();
       });
       TextView live = this.compactButton("LIVE", true);
-      LinearLayout.LayoutParams llp = this.lp(this.dp(48.0F), this.dp(40.0F));
+      LinearLayout.LayoutParams llp = this.lp(this.dp(56.0F), this.dp(48.0F));
       llp.leftMargin = this.dp(5.0F);
       this.toolbar.addView(live, llp);
       live.setOnClickListener((v) -> {
@@ -597,11 +834,20 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.render();
       });
       this.root.addView(this.toolbar);
+      this.onlineSearchBar = this.col();
+      this.onlineSearchBar.setPadding(this.dp(14.0F), this.dp(2.0F), this.dp(14.0F), this.dp(4.0F));
+      this.onlineSearchBar.setVisibility(View.GONE);
+      this.root.addView(this.onlineSearchBar);
       this.pageScroll = new ScrollView(this);
       this.pageScroll.setFillViewport(true);
       this.pageScroll.setClipToPadding(false);
       this.pageBody = this.col();
-      this.pageBody.setPadding(this.dp(14.0F), this.dp(7.0F), this.dp(14.0F), this.dp(16.0F));
+      this.pageBody.setPadding(this.dp(14.0F), 0, this.dp(14.0F), this.dp(18.0F));
+      GradientDrawable pageGap = new GradientDrawable();
+      pageGap.setColor(Color.TRANSPARENT);
+      pageGap.setSize(this.dp(1), this.dp(3));
+      this.pageBody.setDividerDrawable(pageGap);
+      this.pageBody.setShowDividers(LinearLayout.SHOW_DIVIDER_MIDDLE);
       this.pageScroll.addView(this.pageBody);
       this.root.addView(this.pageScroll, new LinearLayout.LayoutParams(-1, 0, 1.0F));
       this.miniPlayer = this.row();
@@ -623,8 +869,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.root.addView(this.miniPlayer, mlp);
       this.miniPlayer.setVisibility(8);
       this.miniPlayer.setOnClickListener((v) -> {
-         this.page = "Player";
-         this.render();
+         if (this.current == null) return;
+         this.openPlayerUi();
       });
       this.miniPlay.setOnClickListener((v) -> {
          this.togglePlayback();
@@ -639,6 +885,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          String dest = labels[i];
          LinearLayout item = this.col();
          item.setGravity(17);
+         item.setMinimumHeight(this.dp(52));
          TextView g = this.text(glyphs[i], 18, MUTED, true);
          g.setGravity(17);
          item.addView(g);
@@ -697,6 +944,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
 
          this.updateNavigation();
+         this.updateOnlineSearchBar();
          if (this.toolbar != null) {
             this.toolbar.setVisibility(this.page.equals("Player") ? 8 : 0);
          }
@@ -723,6 +971,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
                for (View cachedView : cachedViews) this.pageBody.addView(cachedView);
                this.attachedPageCacheKey = targetCacheKey;
                this.updateMini();
+               this.recordNavState();
                return;
             }
          }
@@ -772,13 +1021,42 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
 
          this.attachedPageCacheKey = targetCacheKey;
          this.updateMini();
+         this.recordNavState();
       }
+   }
+
+   /** Pushes the previously rendered screen onto the back stack whenever the
+    * visible screen changes, so Back can walk the user's real history. */
+   private void recordNavState() {
+      NavState newState = new NavState();
+      if (!this.navRestoring && this.lastNavState != null && !this.lastNavState.page.equals("Player")
+            && !this.lastNavState.key().equals(newState.key())
+            && (this.navBackStack.isEmpty() || !this.navBackStack.peek().key().equals(this.lastNavState.key()))) {
+         this.navBackStack.push(this.lastNavState);
+         while (this.navBackStack.size() > 40) this.navBackStack.removeLast();
+      }
+      this.lastNavState = newState;
+   }
+
+   /** Restores the most recent distinct screen from the back stack. */
+   private boolean restorePreviousNavState() {
+      String currentKey = this.lastNavState == null ? null : this.lastNavState.key();
+      while (!this.navBackStack.isEmpty()) {
+         NavState state = this.navBackStack.pop();
+         if (currentKey != null && state.key().equals(currentKey)) continue;
+         this.navRestoring = true;
+         state.restore();
+         this.render();
+         this.navRestoring = false;
+         return true;
+      }
+      return false;
    }
 
    private String pageCacheKey(String pageName) {
       if (pageName.equals("Home")) return "Home|" + this.searchQuery;
       if (pageName.equals("Movies")) return "Movies|" + this.mediaFilter + "|" + this.searchQuery;
-      if (pageName.equals("Music")) return "Music|" + this.musicMode + "|" + this.searchQuery;
+      if (pageName.equals("Music")) return "Music|" + this.musicMode + "|" + this.searchQuery + (this.musicMode.equals("Go Online") ? "|" + this.onlineView + (this.onlineView.equals("detail") ? "|" + this.onlineDetailTitle : "") : "");
       if (pageName.equals("Playlists")) return "Playlists";
       if (pageName.equals("More")) return "More";
       return null;
@@ -797,18 +1075,25 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          boolean on = names[i].equals(selected);
          ((TextView)this.navGlyphs.get(i)).setTextColor(on ? LILAC : MUTED);
          ((TextView)this.navLabels.get(i)).setTextColor(on ? LILAC : MUTED);
-         ((LinearLayout)this.navItems.get(i)).setBackground(on ? this.shape(Color.rgb(39, 20, 58), 12) : null);
+         ((LinearLayout)this.navItems.get(i)).setBackground(on ? this.touchSurface(Color.rgb(39, 20, 58), 12) : null);
       }
 
    }
 
    private void section(String label, Runnable seeAll) {
       LinearLayout h = this.row();
-      h.setPadding(this.dp(1.0F), this.dp(16.0F), this.dp(1.0F), this.dp(8.0F));
-      h.addView(this.text(label, 17, -1, true), new LinearLayout.LayoutParams(0, -2, 1.0F));
+      int topSpacing = this.page.equals("Settings") && this.pageBody.getChildCount() == 0 ? this.dp(2.0F) : this.dp(8.0F);
+      h.setPadding(this.dp(1.0F), topSpacing, this.dp(1.0F), this.dp(6.0F));
+      TextView heading = this.text(label, 17, -1, true);
+      heading.setMaxLines(2);
+      heading.setEllipsize(TextUtils.TruncateAt.END);
+      h.addView(heading, new LinearLayout.LayoutParams(0, -2, 1.0F));
       if (seeAll != null) {
          TextView a = this.text("See all", 11, LILAC, true);
-         h.addView(a);
+         a.setGravity(Gravity.CENTER);
+         a.setMinWidth(this.dp(56));
+         a.setMinHeight(this.dp(44));
+         h.addView(a, this.lp(-2, this.dp(44)));
          a.setOnClickListener((v) -> {
             seeAll.run();
          });
@@ -827,9 +1112,12 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          boolean on = i == 0 && selected.equals("Videos") || dest.equals(selected);
          TextView b = this.text(labels[i], 11, on ? PURPLE : MUTED, true);
          b.setGravity(17);
-         b.setPadding(this.dp(3.0F), this.dp(12.0F), this.dp(3.0F), this.dp(12.0F));
-         b.setBackground(on ? this.shape(Color.rgb(43, 27, 15), 8) : null);
-         LinearLayout.LayoutParams p = this.lp(0, -2);
+         b.setPadding(this.dp(4.0F), this.dp(8.0F), this.dp(4.0F), this.dp(8.0F));
+         b.setMinHeight(this.dp(44));
+         b.setMaxLines(1);
+         b.setEllipsize(TextUtils.TruncateAt.END);
+         b.setBackground(on ? this.touchSurface(Color.rgb(48, 22, 70), 10) : null);
+         LinearLayout.LayoutParams p = this.lp(0, this.dp(44));
          p.weight = 1.0F;
          tabs.addView(b, p);
          b.setOnClickListener((v) -> {
@@ -854,9 +1142,9 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       search.setText(this.searchQuery);
       search.setPadding(this.dp(12.0F), 0, this.dp(8.0F), 0);
       search.setBackground(this.shape(CARD, 18));
-      searchRow.addView(search, new LinearLayout.LayoutParams(0, this.dp(40.0F), 1.0F));
+      searchRow.addView(search, new LinearLayout.LayoutParams(0, this.dp(48.0F), 1.0F));
       TextView go = this.compactButton("⌕", false);
-      LinearLayout.LayoutParams gp = this.lp(this.dp(42.0F), this.dp(40.0F));
+      LinearLayout.LayoutParams gp = this.lp(this.dp(44.0F), this.dp(48.0F));
       gp.leftMargin = this.dp(6.0F);
       searchRow.addView(go, gp);
       Runnable apply = () -> {
@@ -950,7 +1238,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          TextView c = this.text(n, 11, selected.equals(n) ? -1 : MUTED, true);
          c.setGravity(17);
          c.setPadding(this.dp(14.0F), this.dp(8.0F), this.dp(14.0F), this.dp(8.0F));
-         c.setBackground(this.shape(selected.equals(n) ? PURPLE : CARD, 18));
+         c.setMinHeight(this.dp(44));
+         c.setBackground(this.touchSurface(selected.equals(n) ? PURPLE : CARD, 18));
          LinearLayout.LayoutParams p = this.lp(-2, -2);
          p.rightMargin = this.dp(6.0F);
          r.addView(c, p);
@@ -961,6 +1250,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
 
       HorizontalScrollView h = new HorizontalScrollView(this);
       h.setHorizontalScrollBarEnabled(false);
+      h.setClipToPadding(false);
+      h.setFillViewport(false);
       h.addView(r);
       LinearLayout.LayoutParams stripParams = this.lp(-1, -2);
       stripParams.bottomMargin = this.dp(10.0F);
@@ -987,10 +1278,14 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    }
 
    private void musicPage() {
-      this.chips(new String[]{"Songs", "Albums", "Artists", "Folders"}, this.musicMode, (s) -> {
+      this.chips(new String[]{"Songs", "Albums", "Artists", "Folders", "Go Online"}, this.musicMode, (s) -> {
          this.musicMode = s;
          this.render();
       });
+      if (this.musicMode.equals("Go Online")) {
+         this.onlineMusicPage();
+         return;
+      }
       if (this.musicMode.equals("Folders")) {
          this.folderRows(true);
       } else {
@@ -1019,14 +1314,17 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
                MediaItem first = (MediaItem)((ArrayList)groups.get(k)).get(0);
                LinearLayout r = this.row();
                r.setPadding(this.dp(12.0F), this.dp(10.0F), this.dp(10.0F), this.dp(10.0F));
-               r.setBackground(this.shape(CARD, 14));
+               r.setBackground(this.touchSurface(CARD, 14));
                TextView ic = this.text("♫", 20, LILAC, true);
                r.addView(ic, this.lp(this.dp(42.0F), this.dp(42.0F)));
                LinearLayout info = this.col();
                info.setPadding(this.dp(9.0F), 0, 0, 0);
-               info.addView(this.text(k, 13, -1, true));
+               TextView groupName = this.text(k, 13, -1, true);
+               groupName.setMaxLines(2);
+               groupName.setEllipsize(TextUtils.TruncateAt.END);
+               info.addView(groupName);
                info.addView(this.text(((ArrayList)groups.get(k)).size() + " songs", 11, MUTED, false));
-               r.addView(info);
+               r.addView(info, new LinearLayout.LayoutParams(0, -2, 1.0F));
                LinearLayout.LayoutParams rp = this.lp(-1, -2);
                rp.bottomMargin = this.dp(6.0F);
                this.pageBody.addView(r, rp);
@@ -1042,6 +1340,428 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
 
       }
+   }
+
+   // ------------------------------------------------------------------ Go Online
+
+   private void onlineMusicPage() {
+      if (this.onlineView.equals("detail")) { this.onlineDetailPage(); return; }
+
+      // The search field lives in the persistent `onlineSearchBar` (managed by
+      // updateOnlineSearchBar) so that render() rebuilds never steal its focus
+      // or dismiss the keyboard.
+
+      if (!this.onlineMoods.isEmpty() && this.onlineSearchResults == null) {
+         HorizontalScrollView moodScroll = new HorizontalScrollView(this);
+         moodScroll.setHorizontalScrollBarEnabled(false);
+         LinearLayout moodRow = this.row();
+         for (OnlineMusicService.OnlineMood mood : this.onlineMoods) {
+            TextView chip = this.text(mood.title, 12, LILAC, true);
+            chip.setPadding(this.dp(13), this.dp(8), this.dp(13), this.dp(8));
+            chip.setBackground(this.touchSurface(Color.rgb(49, 24, 71), 20));
+            LinearLayout.LayoutParams cp = this.lp(-2, -2);
+            cp.rightMargin = this.dp(8);
+            moodRow.addView(chip, cp);
+            chip.setOnClickListener(v -> this.openOnlineMood(mood));
+         }
+         moodScroll.addView(moodRow);
+         LinearLayout.LayoutParams mp = this.lp(-1, -2);
+         mp.topMargin = this.dp(10);
+         mp.bottomMargin = this.dp(4);
+         this.pageBody.addView(moodScroll, mp);
+      }
+
+      if (this.onlineSearching) {
+         this.pageBody.addView(this.hint("Searching YouTube Music…"));
+         return;
+      }
+      if (this.onlineSearchResults != null) {
+         this.section("Search results", this.onlineSearchResults.isEmpty() ? null : () -> {
+            this.playOnlineList(new ArrayList<>(this.onlineSearchResults), 0);
+         });
+         if (this.onlineSearchResults.isEmpty()) this.pageBody.addView(this.hint("No online songs found for this search."));
+         else for (OnlineMusicService.OnlineTrack t : this.onlineSearchResults) this.onlineTrackRow(t, this.onlineSearchResults);
+         return;
+      }
+
+      if (!this.onlineHomeRequested) {
+         this.onlineHomeRequested = true;
+         this.loadOnlineHome();
+      }
+
+      if (this.onlineLoading) {
+         this.pageBody.addView(this.hint("Loading online music…"));
+         return;
+      }
+      if (!this.onlineError.isEmpty()) {
+         this.pageBody.addView(this.hint(this.onlineError));
+         TextView retry = this.button("Retry", true);
+         this.pageBody.addView(retry, this.lp(-1, -2));
+         retry.setOnClickListener(v -> this.loadOnlineHome());
+         return;
+      }
+      if (this.onlineShelves.isEmpty()) {
+         this.pageBody.addView(this.hint("No online music available right now. Check your connection and retry."));
+         TextView retry = this.button("Retry", true);
+         this.pageBody.addView(retry, this.lp(-1, -2));
+         retry.setOnClickListener(v -> this.loadOnlineHome());
+         return;
+      }
+
+      for (OnlineMusicService.OnlineShelf shelf : this.onlineShelves) {
+         this.section(shelf.title, shelf.tracks.isEmpty() ? null : () -> this.playOnlineList(new ArrayList<>(shelf.tracks), 0));
+         if (!shelf.playlists.isEmpty()) this.pageBody.addView(this.onlinePlaylistRow(shelf.playlists));
+         int shown = 0;
+         for (OnlineMusicService.OnlineTrack t : shelf.tracks) {
+            this.onlineTrackRow(t, shelf.tracks);
+            if (++shown >= 10) break;
+         }
+      }
+   }
+
+   private void onlineDetailPage() {
+      LinearLayout back = this.row();
+      back.setPadding(this.dp(10), this.dp(8), this.dp(10), this.dp(8));
+      back.setBackground(this.touchSurface(CARD, 12));
+      TextView backText = this.text("‹  Back to Discover", 13, LILAC, true);
+      back.addView(backText);
+      this.pageBody.addView(back, this.lp(-1, -2));
+      back.setOnClickListener(v -> { this.onlineView = "home"; this.render(); });
+
+      this.section(this.onlineDetailTitle, null);
+      if (!this.onlineDetailTracks.isEmpty()) {
+         TextView playAll = this.button("▶  Play all", true);
+         this.pageBody.addView(playAll, this.lp(-1, -2));
+         playAll.setOnClickListener(v -> this.playOnlineList(new ArrayList<>(this.onlineDetailTracks), 0));
+         for (OnlineMusicService.OnlineTrack t : this.onlineDetailTracks) this.onlineTrackRow(t, this.onlineDetailTracks);
+         return;
+      }
+      if (this.onlineLoading) { this.pageBody.addView(this.hint("Loading…")); return; }
+      if (this.onlineDetailShelves.isEmpty()) { this.pageBody.addView(this.hint(this.onlineError.isEmpty() ? "Nothing here yet." : this.onlineError)); return; }
+      for (OnlineMusicService.OnlineShelf shelf : this.onlineDetailShelves) {
+         this.section(shelf.title, null);
+         if (!shelf.playlists.isEmpty()) this.pageBody.addView(this.onlinePlaylistRow(shelf.playlists));
+         for (OnlineMusicService.OnlineTrack t : shelf.tracks) this.onlineTrackRow(t, shelf.tracks);
+      }
+   }
+
+   private View onlinePlaylistRow(List<OnlineMusicService.OnlinePlaylist> playlists) {
+      HorizontalScrollView scroll = new HorizontalScrollView(this);
+      scroll.setHorizontalScrollBarEnabled(false);
+      LinearLayout inner = this.row();
+      for (OnlineMusicService.OnlinePlaylist p : playlists) {
+         LinearLayout card = this.col();
+         ImageView art = new ImageView(this);
+         art.setImageResource(R.drawable.solo_player_logo);
+         art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+         art.setBackground(this.shape(Color.rgb(46, 18, 68), 12));
+         art.setClipToOutline(true);
+         card.addView(art, this.lp(this.dp(132), this.dp(132)));
+         OnlineArtwork.load(p.thumbnailUrl, art);
+         TextView title = this.text(p.title, 12, -1, true);
+         title.setMaxLines(2);
+         title.setEllipsize(TextUtils.TruncateAt.END);
+         LinearLayout.LayoutParams tp = this.lp(this.dp(132), -2);
+         tp.topMargin = this.dp(6);
+         card.addView(title, tp);
+         if (!p.subtitle.isEmpty()) {
+            TextView sub = this.text(p.subtitle, 10, MUTED, false);
+            sub.setSingleLine(true);
+            sub.setEllipsize(TextUtils.TruncateAt.END);
+            card.addView(sub, this.lp(this.dp(132), -2));
+         }
+         LinearLayout.LayoutParams cp = this.lp(-2, -2);
+         cp.rightMargin = this.dp(10);
+         inner.addView(card, cp);
+         card.setOnClickListener(v -> this.openOnlinePlaylist(p));
+      }
+      scroll.addView(inner);
+      return scroll;
+   }
+
+   private void onlineTrackRow(OnlineMusicService.OnlineTrack t, List<OnlineMusicService.OnlineTrack> sourceQueue) {
+      LinearLayout r = this.row();
+      r.setPadding(this.dp(9), this.dp(8), this.dp(9), this.dp(8));
+      r.setBackground(this.touchSurface(CARD, 13));
+      ImageView icon = new ImageView(this);
+      icon.setImageResource(R.drawable.solo_player_logo);
+      icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
+      icon.setBackground(this.shape(Color.rgb(46, 18, 68), 10));
+      icon.setClipToOutline(true);
+      r.addView(icon, this.lp(this.dp(49), this.dp(49)));
+      OnlineArtwork.load(t.thumbnailUrl, icon);
+      LinearLayout meta = this.col();
+      meta.setPadding(this.dp(9), 0, this.dp(4), 0);
+      TextView title = this.text(t.title, 13, -1, true);
+      title.setMaxLines(2);
+      title.setEllipsize(TextUtils.TruncateAt.END);
+      meta.addView(title);
+      String sub = t.artist + (t.album.isEmpty() ? "" : " · " + t.album) + (t.durationMs > 0L ? " · " + this.clock(t.durationMs) : "");
+      TextView subtitle = this.text(sub, 11, MUTED, false);
+      subtitle.setSingleLine(true);
+      subtitle.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+      meta.addView(subtitle);
+      r.addView(meta, new LinearLayout.LayoutParams(0, -2, 1.0F));
+      TextView streamBadge = this.text("☁", 16, MUTED, true);
+      streamBadge.setGravity(Gravity.CENTER);
+      streamBadge.setMinWidth(this.dp(40));
+      streamBadge.setMinHeight(this.dp(48));
+      r.addView(streamBadge);
+      LinearLayout.LayoutParams p = this.lp(-1, -2);
+      p.bottomMargin = this.dp(6);
+      this.pageBody.addView(r, p);
+      r.setOnClickListener(v -> this.playOnlineList(sourceQueue, sourceQueue.indexOf(t)));
+   }
+
+   private MediaItem onlineItemFor(OnlineMusicService.OnlineTrack t) {
+      MediaItem item = new MediaItem(t.displayName(), "ytm:" + t.videoId, false, "Online", System.currentTimeMillis(), t.durationMs, t.artist, t.album);
+      item.tvgId = t.videoId;
+      item.logo = t.thumbnailUrl == null ? "" : t.thumbnailUrl;
+      item.agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+      item.referer = "https://music.youtube.com/";
+      return item;
+   }
+
+   private void playOnlineList(List<OnlineMusicService.OnlineTrack> tracks, int index) {
+      if (tracks == null || tracks.isEmpty() || index < 0 || index >= tracks.size()) return;
+      ArrayList<MediaItem> items = new ArrayList<>();
+      for (OnlineMusicService.OnlineTrack t : tracks) items.add(this.onlineItemFor(t));
+      queue.clear();
+      queue.addAll(items);
+      this.play(items.get(index));
+   }
+
+   /** Resolves "ytm:videoId" items lazily — only the track actually played hits the network,
+    * then the next two queue entries are prefetched so Next feels instant. */
+   private OnlineMusicService onlineService() {
+      if (this.onlineService == null) this.onlineService = new OnlineMusicService(new File(this.getCacheDir(), "online-cache"));
+      return this.onlineService;
+   }
+
+   private boolean resolvedOnlineFileExists(String resolvedUri) {
+      try {
+         Uri parsed = Uri.parse(resolvedUri);
+         String path = parsed.getPath();
+         return path != null && new File(path).isFile() && new File(path).length() > 0L;
+      } catch (Exception e) {
+         return false;
+      }
+   }
+
+   private String onlineVideoId(MediaItem item) {
+      return item.tvgId.isEmpty() ? item.uri.substring(4) : item.tvgId;
+   }
+
+   private void resolveOnlineItem(final MediaItem item) {
+      final String videoId = this.onlineVideoId(item);
+      String existing = this.onlineResolvedUrls.get(videoId);
+      if (existing != null && this.resolvedOnlineFileExists(existing)) { this.play(item); return; }
+      if (existing != null) this.onlineResolvedUrls.remove(videoId);
+      this.setStreamLoading(true, "Resolving online track…");
+      this.onlineWorker.execute(() -> {
+         try {
+            final String url = Uri.fromFile(this.onlineService().downloadAudio(videoId)).toString();
+            this.onlineResolvedUrls.put(videoId, url);
+            this.handler.post(() -> {
+               this.play(item);
+               this.prefetchOnlineNeighbors(item);
+            });
+         } catch (Exception e) {
+            final String message = e.getMessage() == null ? "Could not load this song" : e.getMessage();
+            this.handler.post(() -> { this.setStreamLoading(false, null); this.toast("Online playback failed: " + message); });
+         }
+      });
+   }
+
+   private void prefetchOnlineNeighbors(MediaItem played) {
+      int index = queue.indexOf(played);
+      if (index < 0) return;
+      for (int i = index + 1; i < Math.min(index + 3, queue.size()); i++) {
+         MediaItem next = queue.get(i);
+         if (!next.uri.startsWith("ytm:")) continue;
+         final String videoId = this.onlineVideoId(next);
+         if (this.onlineResolvedUrls.containsKey(videoId)) continue;
+         this.onlineWorker.execute(() -> {
+            try { this.onlineResolvedUrls.put(videoId, Uri.fromFile(this.onlineService().downloadAudio(videoId)).toString()); }
+            catch (Exception ignored) {}
+         });
+      }
+   }
+
+   private void loadOnlineHome() {
+      this.onlineLoading = true;
+      this.onlineError = "";
+      this.onlineSearchResults = null;
+      this.onlineView = "home";
+      final String country = Locale.getDefault().getCountry();
+      this.onlineWorker.execute(() -> {
+         try {
+            final ArrayList<OnlineMusicService.OnlineShelf> shelves = new ArrayList<>(this.onlineService().home(country));
+            final ArrayList<OnlineMusicService.OnlineMood> moods;
+            ArrayList<OnlineMusicService.OnlineMood> loaded;
+            try { loaded = new ArrayList<>(this.onlineService().moods(country)); }
+            catch (Exception e) { loaded = new ArrayList<>(); }
+            moods = loaded;
+            this.handler.post(() -> {
+               this.onlineShelves = shelves;
+               this.onlineMoods = moods;
+               this.onlineLoading = false;
+               this.onlineError = "";
+               if (this.onOnlineMusic()) this.render();
+            });
+         } catch (Exception e) {
+            final String message = e.getMessage() == null ? "Online music is unavailable" : e.getMessage();
+            this.handler.post(() -> {
+               this.onlineLoading = false;
+               this.onlineError = message;
+               if (this.onOnlineMusic()) this.render();
+            });
+         }
+      });
+   }
+
+   private void loadOnlineSearch(final String query) {
+      if (query.isEmpty()) {
+         if (this.onlineSearchResults == null && !this.onlineSearching) return;
+         this.onlineSearchResults = null;
+         this.onlineSearching = false;
+         this.onlineError = "";
+         if (this.onOnlineMusic()) this.render();
+         return;
+      }
+      this.onlineSearching = true;
+      this.onlineError = "";
+      final String country = Locale.getDefault().getCountry();
+      this.onlineWorker.execute(() -> {
+         try {
+            final ArrayList<OnlineMusicService.OnlineTrack> results = new ArrayList<>(this.onlineService().search(query, country));
+            this.handler.post(() -> {
+               if (!query.equals(this.onlineSearchQuery)) return;
+               this.onlineSearchResults = results;
+               this.onlineSearching = false;
+               if (this.onOnlineMusic()) this.render();
+            });
+         } catch (Exception e) {
+            final String message = e.getMessage() == null ? "Search failed" : e.getMessage();
+            this.handler.post(() -> {
+               if (!query.equals(this.onlineSearchQuery)) return;
+               this.onlineSearching = false;
+               this.onlineError = message;
+               this.onlineSearchResults = new ArrayList<>();
+               if (this.onOnlineMusic()) this.render();
+            });
+         }
+      });
+   }
+
+   private void openOnlinePlaylist(OnlineMusicService.OnlinePlaylist playlist) {
+      this.onlineView = "detail";
+      this.onlineDetailTitle = playlist.title;
+      this.onlineDetailTracks = new ArrayList<>();
+      this.onlineDetailShelves = new ArrayList<>();
+      this.onlineLoading = true;
+      this.onlineError = "";
+      this.render();
+      final String country = Locale.getDefault().getCountry();
+      this.onlineWorker.execute(() -> {
+         try {
+            final ArrayList<OnlineMusicService.OnlineTrack> tracks = new ArrayList<>(this.onlineService().playlistTracks(playlist.browseId, country));
+            this.handler.post(() -> {
+               this.onlineDetailTracks = tracks;
+               this.onlineLoading = false;
+               if (this.onOnlineMusic()) this.render();
+            });
+         } catch (Exception e) {
+            final String message = e.getMessage() == null ? "Could not load this playlist" : e.getMessage();
+            this.handler.post(() -> {
+               this.onlineLoading = false;
+               this.onlineError = message;
+               if (this.onOnlineMusic()) this.render();
+            });
+         }
+      });
+   }
+
+   private void openOnlineMood(OnlineMusicService.OnlineMood mood) {
+      this.onlineView = "detail";
+      this.onlineDetailTitle = mood.title;
+      this.onlineDetailTracks = new ArrayList<>();
+      this.onlineDetailShelves = new ArrayList<>();
+      this.onlineLoading = true;
+      this.onlineError = "";
+      this.render();
+      final String country = Locale.getDefault().getCountry();
+      this.onlineWorker.execute(() -> {
+         try {
+            final ArrayList<OnlineMusicService.OnlineShelf> shelves = new ArrayList<>(this.onlineService().moodPlaylists(mood, country));
+            this.handler.post(() -> {
+               this.onlineDetailShelves = shelves;
+               this.onlineLoading = false;
+               if (this.onOnlineMusic()) this.render();
+            });
+         } catch (Exception e) {
+            final String message = e.getMessage() == null ? "Could not load this category" : e.getMessage();
+            this.handler.post(() -> {
+               this.onlineLoading = false;
+               this.onlineError = message;
+               if (this.onOnlineMusic()) this.render();
+            });
+         }
+      });
+   }
+
+   private boolean onOnlineMusic() {
+      return this.page.equals("Music") && this.musicMode.equals("Go Online");
+   }
+
+   /** Keeps the online search field in the persistent shell (outside pageBody)
+    * so render() rebuilds can't destroy it — typing focus and the keyboard stay
+    * up while results stream in. Only Enter/dismiss hides the keyboard. */
+   private void updateOnlineSearchBar() {
+      if (this.onlineSearchBar == null) return;
+      boolean show = this.onOnlineMusic() && this.onlineView.equals("home");
+      if (!show) {
+         this.onlineSearchBar.setVisibility(View.GONE);
+         if (this.onlineSearchField != null && this.onlineSearchField.hasFocus()) {
+            this.onlineSearchField.clearFocus();
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(this.onlineSearchField.getWindowToken(), 0);
+         }
+         return;
+      }
+      if (this.onlineSearchField == null) {
+         final EditText field = this.edit("Search YouTube Music");
+         field.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+         field.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int c, int f) {}
+            public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            public void afterTextChanged(Editable s) {
+               final String q = s.toString().trim();
+               if (q.equals(onlineSearchQuery)) return;
+               onlineSearchQuery = q;
+               final long token = ++onlineSearchToken;
+               handler.postDelayed(() -> { if (token == onlineSearchToken) loadOnlineSearch(q); }, 500L);
+            }
+         });
+         field.setOnEditorActionListener((v, actionId, event) -> {
+            boolean go = actionId == EditorInfo.IME_ACTION_SEARCH || actionId == EditorInfo.IME_ACTION_DONE
+                  || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER && event.getAction() == KeyEvent.ACTION_DOWN);
+            if (!go) return false;
+            onlineSearchToken++;
+            MainActivity.this.loadOnlineSearch(field.getText().toString().trim());
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(field.getWindowToken(), 0);
+            field.clearFocus();
+            return true;
+         });
+         this.onlineSearchField = field;
+         this.onlineSearchBar.addView(field, this.lp(-1, this.dp(48.0F)));
+      }
+      if (!this.onlineSearchField.getText().toString().equals(this.onlineSearchQuery)) {
+         this.onlineSearchField.setText(this.onlineSearchQuery);
+         this.onlineSearchField.setSelection(this.onlineSearchQuery.length());
+      }
+      this.onlineSearchBar.setVisibility(View.VISIBLE);
    }
 
    private void playlistsPage() {
@@ -1065,17 +1785,24 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private void playlistRow(String name, int n) {
       LinearLayout r = this.row();
       r.setPadding(this.dp(12.0F), this.dp(10.0F), this.dp(10.0F), this.dp(10.0F));
-      r.setBackground(this.shape(CARD, 14));
+      r.setBackground(this.touchSurface(CARD, 14));
       TextView icon = this.text(name.equals("Favorites") ? "♥" : "♫", 20, LILAC, true);
       icon.setGravity(17);
       icon.setBackground(this.shape(Color.rgb(49, 18, 76), 12));
       r.addView(icon, this.lp(this.dp(44.0F), this.dp(44.0F)));
       LinearLayout info = this.col();
       info.setPadding(this.dp(10.0F), 0, 0, 0);
-      info.addView(this.text(name, 13, -1, true));
+      TextView title = this.text(name, 13, -1, true);
+      title.setMaxLines(2);
+      title.setEllipsize(TextUtils.TruncateAt.END);
+      info.addView(title);
       info.addView(this.text(n + " tracks", 11, MUTED, false));
       r.addView(info, new LinearLayout.LayoutParams(0, -2, 1.0F));
       TextView more = this.text("⋮", 20, MUTED, true);
+      more.setGravity(Gravity.CENTER);
+      more.setMinWidth(this.dp(40));
+      more.setMinHeight(this.dp(48));
+      more.setContentDescription("More playlist actions");
       r.addView(more);
       LinearLayout.LayoutParams rp = this.lp(-1, -2);
       rp.bottomMargin = this.dp(7.0F);
@@ -1110,7 +1837,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          String name = items[i];
          LinearLayout r = this.row();
          r.setPadding(this.dp(12.0F), this.dp(12.0F), this.dp(10.0F), this.dp(12.0F));
-         r.setBackground(this.shape(CARD, 14));
+         r.setBackground(this.touchSurface(CARD, 14));
          TextView ic = this.text(glyphs[i], 18, LILAC, true);
          ic.setGravity(17);
          ic.setBackground(this.shape(Color.rgb(47, 19, 71), 11));
@@ -1155,7 +1882,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          });
       }
 
-      LinearLayout castRow = this.row(); castRow.setPadding(this.dp(12), this.dp(8), this.dp(12), this.dp(8)); castRow.setBackground(this.shape(CARD, 13));
+      LinearLayout castRow = this.row(); castRow.setPadding(this.dp(12), this.dp(8), this.dp(12), this.dp(8)); castRow.setBackground(this.touchSurface(CARD, 13));
       LinearLayout castInfo = this.col();
       castInfo.addView(this.text("Cast to TV or speaker", 13, Color.WHITE, true));
       this.castStatusText = this.hint(""); castInfo.addView(this.castStatusText); this.updateCastUiStatus();
@@ -1195,7 +1922,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.pageBody.addView(recovery, this.lp(-1, -2)); recovery.setOnClickListener(v -> this.resetPrivateVaultPin());
       EditText search = this.edit("Search private media");
       search.setText(this.privateMediaSearch);
-      LinearLayout.LayoutParams searchLp=this.lp(-1,this.dp(42));searchLp.topMargin=this.dp(8);this.pageBody.addView(search,searchLp);
+      LinearLayout.LayoutParams searchLp=this.lp(-1,this.dp(48));searchLp.topMargin=this.dp(8);this.pageBody.addView(search,searchLp);
       LinearLayout listing=this.col(); LinearLayout.LayoutParams listLp=this.lp(-1,-2);listLp.topMargin=this.dp(8);this.pageBody.addView(listing,listLp);
       if(this.privateVaultSelectionMode){LinearLayout bar=this.row();TextView count=this.text(this.privateSelectedIds.size()+" selected",13,LILAC,true);bar.addView(count,new LinearLayout.LayoutParams(0,-2,1));TextView remove=this.button("Remove",false);bar.addView(remove);TextView cancel=this.button("Cancel",false);bar.addView(cancel);listing.addView(bar);remove.setOnClickListener(v->{if(this.privateSelectedIds.isEmpty()){this.toast("Select at least one item");return;}new AlertDialog.Builder(this).setTitle("Remove selected private copies?").setMessage("Only the encrypted vault copies are removed. Originals that were copied remain where they are; moved originals stay in the vault until restored.").setNegativeButton("Cancel",null).setPositiveButton("Remove",(d,w)->{for(String id:new ArrayList<>(this.privateSelectedIds))this.removePrivateVaultRecordOnly(id);this.privateSelectedIds.clear();this.privateVaultSelectionMode=false;this.lastLibraryScanAt=0L;this.scanLibrary();this.render();this.toast("Selected items removed from Private Media");}).show();});cancel.setOnClickListener(v->{this.privateVaultSelectionMode=false;this.privateSelectedIds.clear();this.render();});}
       if (!this.privateMediaPath.isEmpty()) {
@@ -1215,7 +1942,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          if (slash>=0) folders.add(prefix+tail.substring(0,slash));
       }
       for (String folder : folders) {
-         LinearLayout row=this.row(); row.setPadding(this.dp(12),this.dp(12),this.dp(10),this.dp(12)); row.setBackground(this.shape(CARD,14));
+         LinearLayout row=this.row(); row.setPadding(this.dp(12),this.dp(12),this.dp(10),this.dp(12)); row.setBackground(this.touchSurface(CARD,14));
          TextView icon=this.text("▰",20,LILAC,true); icon.setGravity(Gravity.CENTER); row.addView(icon,this.lp(this.dp(44),this.dp(44)));
          String label=folder.substring(folder.lastIndexOf('/')+1); TextView title=this.text(label,14,Color.WHITE,true); LinearLayout.LayoutParams tlp=this.lp(0,-2);tlp.weight=1;tlp.leftMargin=this.dp(10);row.addView(title,tlp);
          row.setTag(label);
@@ -1595,6 +2322,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       };
       button.setContentDescription("Choose a Cast device");
       button.setBackground(this.shape(CARD, 12));
+      int pad = this.dp(9);
+      button.setPadding(pad, pad, pad, pad);
       button.setAlwaysVisible(true);
       if (this.castContext == null) {
          button.setOnClickListener(v -> this.toast("Casting is unavailable. Check Google Play services and try again."));
@@ -1679,7 +2408,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          if (this.castPickerStatus != null) this.castPickerStatus.setText("Casting is active"); if (this.castPickerProgressContainer != null) this.castPickerProgressContainer.setVisibility(View.GONE); return;
       }
       for (MediaRouter.RouteInfo route : new ArrayList<>(this.discoveredCastRoutes)) {
-         TextView device = this.text("▣   " + route.getName(), 15, Color.WHITE, true); device.setPadding(this.dp(12), this.dp(14), this.dp(12), this.dp(14)); device.setBackground(this.shape(CARD, 14)); LinearLayout.LayoutParams rowLp = this.lp(-1, -2); rowLp.bottomMargin = this.dp(7); this.castPickerRouteList.addView(device, rowLp);
+         TextView device = this.text("▣   " + route.getName(), 15, Color.WHITE, true); device.setMaxLines(2); device.setEllipsize(TextUtils.TruncateAt.END); device.setPadding(this.dp(12), this.dp(14), this.dp(12), this.dp(14)); device.setBackground(this.touchSurface(CARD, 14)); LinearLayout.LayoutParams rowLp = this.lp(-1, -2); rowLp.bottomMargin = this.dp(7); this.castPickerRouteList.addView(device, rowLp);
          device.setOnClickListener(v -> { try { route.select(); if (this.castPickerDialog != null) this.castPickerDialog.dismiss(); } catch (Exception error) { Log.e("SoloPlayer", "Cast device selection failed", error); this.toast("Could not connect to " + route.getName()); } });
       }
       if (!this.discoveredCastRoutes.isEmpty()) {
@@ -1796,7 +2525,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       actions.add(this.createPipAction(android.R.drawable.ic_media_previous, "Previous", "pip_previous", 2));
       actions.add(this.createPipAction(android.R.drawable.ic_media_next, "Next", "pip_next", 3));
       builder.setActions(actions);
-      if (VERSION.SDK_INT >= 31) builder.setAutoEnterEnabled(autoEnter && this.isPlaybackActive());
+      if (VERSION.SDK_INT >= 31) builder.setAutoEnterEnabled(autoEnter && this.fullscreen && this.isPlaybackActive());
       try { this.setPictureInPictureParams(builder.build()); } catch (Exception error) { Log.w("SoloPlayer", "Unable to update PiP parameters", error); }
    }
 
@@ -1815,6 +2544,11 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.toast("Floating video is not supported on this device"); return;
       }
       if (!this.currentIsVideo() || !this.isPlaybackActive()) { this.toast("Start a video before opening the floating window"); return; }
+      if (!this.fullscreen) {
+         this.toggleFullscreen();
+         this.handler.postDelayed(this::enterPlayerPip, 250L);
+         return;
+      }
       this.updatePipParams(false);
       this.preparePipUi();
       try {
@@ -1868,7 +2602,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
 
    @Override public void onUserLeaveHint() {
       super.onUserLeaveHint();
-      if (VERSION.SDK_INT >= 26 && !this.isInPictureInPictureMode() && this.currentIsVideo() && this.isPlaybackActive() && !this.isCasting()) this.enterPlayerPip();
+      if (VERSION.SDK_INT >= 26 && this.fullscreen && !this.isInPictureInPictureMode() && this.currentIsVideo() && this.isPlaybackActive() && !this.isCasting()) this.enterPlayerPip();
    }
 
    @Override protected void onNewIntent(Intent intent) {
@@ -1956,13 +2690,21 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
                   final String folderPath = normalizedBase.isEmpty() ? child : normalizedBase + "/" + child;
                   LinearLayout r = this.row();
                   r.setPadding(this.dp(12.0F), this.dp(10.0F), this.dp(10.0F), this.dp(10.0F));
-                  r.setBackground(this.shape(CARD, 14));
+                  r.setBackground(this.touchSurface(CARD, 14));
                   TextView ic = this.text("▰", 19, LILAC, true);
                   r.addView(ic, this.lp(this.dp(38.0F), this.dp(38.0F)));
                   LinearLayout info = this.col();
                   info.addView(this.text(child, 13, -1, true));
                   info.addView(this.text(dirs.get(child) + " media files in this folder", 11, MUTED, false));
-                  r.addView(info, new LinearLayout.LayoutParams(0, -2, 1.0F));
+                  TextView folderName = (TextView)info.getChildAt(0);
+                  folderName.setMaxLines(2);
+                  folderName.setEllipsize(TextUtils.TruncateAt.END);
+                  TextView folderCount = (TextView)info.getChildAt(1);
+                  folderCount.setSingleLine(true);
+                  folderCount.setEllipsize(TextUtils.TruncateAt.END);
+                  LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(0, -2, 1.0F);
+                  infoLp.leftMargin = this.dp(10);
+                  r.addView(info, infoLp);
                   LinearLayout.LayoutParams rp = this.lp(-1, -2);
                   rp.bottomMargin = this.dp(5.0F);
                   this.pageBody.addView(r, rp);
@@ -2011,7 +2753,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private void networkPage() {
       this.browserTabs("Network");
       EditText filter = this.edit("Search channels and bookmarks"); filter.setText(this.networkSearchQuery);
-      this.pageBody.addView(filter, this.lp(-1, this.dp(42.0F)));
+      this.pageBody.addView(filter, this.lp(-1, this.dp(48.0F)));
       LinearLayout results = this.col(); this.pageBody.addView(results);
       filter.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence x,int a,int c,int f){}public void onTextChanged(CharSequence x,int a,int before,int count){networkSearchQuery=x.toString();refreshNetworkResults(results,networkSearchQuery);}public void afterTextChanged(Editable x){}});
       LinearLayout panel = this.card(); panel.setPadding(this.dp(15), this.dp(14), this.dp(15), this.dp(14));
@@ -2131,17 +2873,23 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       });
    }
    private void addNetworkResult(MediaItem item, LinearLayout target) {
-      LinearLayout r = this.row(); r.setPadding(this.dp(12), this.dp(10), this.dp(10), this.dp(10)); r.setBackground(this.shape(CARD, 13));
+      LinearLayout r = this.row(); r.setPadding(this.dp(12), this.dp(10), this.dp(10), this.dp(10)); r.setBackground(this.touchSurface(CARD, 13));
       ImageView icon = new ImageView(this); icon.setImageResource(R.drawable.solo_player_logo); icon.setScaleType(ScaleType.CENTER_CROP); icon.setBackground(this.shape(Color.rgb(46, 18, 68), 9)); icon.setClipToOutline(true); r.addView(icon, this.lp(this.dp(36), this.dp(36))); this.loadChannelLogo(item, icon);
-      LinearLayout info = this.col(); info.setPadding(this.dp(9), 0, this.dp(5), 0); info.addView(this.text(item.name, 13, Color.WHITE, true)); info.addView(this.text(item.group.isEmpty() ? item.uri : item.group + "  ·  " + item.uri, 10, MUTED, false)); r.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+      LinearLayout info = this.col(); info.setPadding(this.dp(9), 0, this.dp(5), 0);
+      TextView name = this.text(item.name, 13, Color.WHITE, true); name.setMaxLines(2); name.setEllipsize(TextUtils.TruncateAt.END); info.addView(name);
+      TextView description = this.text(item.group.isEmpty() ? item.uri : item.group + "  ·  " + item.uri, 10, MUTED, false); description.setSingleLine(true); description.setEllipsize(TextUtils.TruncateAt.MIDDLE); info.addView(description);
+      r.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
       TextView save = this.text("☆", 22, LILAC, true); r.addView(save); save.setContentDescription("Bookmark stream"); save.setOnClickListener(v -> { if (this.saveStreamBookmark(item, null)) this.refreshNetworkResults(target, this.networkSearchQuery); });
       LinearLayout.LayoutParams rp = this.lp(-1, -2); rp.bottomMargin = this.dp(5); target.addView(r, rp); r.setOnClickListener(v -> this.play(item));
    }
    private void addBookmarkResult(MediaItem item, LinearLayout target) {
-      LinearLayout r = this.row(); r.setPadding(this.dp(12), this.dp(10), this.dp(10), this.dp(10)); r.setBackground(this.shape(CARD, 13));
+      LinearLayout r = this.row(); r.setPadding(this.dp(12), this.dp(10), this.dp(10), this.dp(10)); r.setBackground(this.touchSurface(CARD, 13));
       ImageView icon = new ImageView(this); icon.setImageResource(R.drawable.solo_player_logo); icon.setScaleType(ScaleType.CENTER_CROP); icon.setBackground(this.shape(Color.rgb(46, 18, 68), 9)); icon.setClipToOutline(true); r.addView(icon, this.lp(this.dp(36), this.dp(36))); this.loadChannelLogo(item, icon);
-      LinearLayout info = this.col(); info.setPadding(this.dp(9), 0, this.dp(5), 0); info.addView(this.text(item.name, 13, Color.WHITE, true)); info.addView(this.text(item.group.isEmpty() ? item.uri : item.group + "  ·  " + item.uri, 10, MUTED, false)); r.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
-      TextView more = this.text("⋮", 21, MUTED, true); r.addView(more); LinearLayout.LayoutParams rp = this.lp(-1, -2); rp.bottomMargin = this.dp(5); target.addView(r, rp);
+      LinearLayout info = this.col(); info.setPadding(this.dp(9), 0, this.dp(5), 0);
+      TextView name = this.text(item.name, 13, Color.WHITE, true); name.setMaxLines(2); name.setEllipsize(TextUtils.TruncateAt.END); info.addView(name);
+      TextView description = this.text(item.group.isEmpty() ? item.uri : item.group + "  ·  " + item.uri, 10, MUTED, false); description.setSingleLine(true); description.setEllipsize(TextUtils.TruncateAt.MIDDLE); info.addView(description);
+      r.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+      TextView more = this.text("⋮", 21, MUTED, true); more.setGravity(Gravity.CENTER); more.setMinWidth(this.dp(40)); more.setMinHeight(this.dp(48)); r.addView(more); LinearLayout.LayoutParams rp = this.lp(-1, -2); rp.bottomMargin = this.dp(5); target.addView(r, rp);
       r.setOnClickListener(v -> this.play(item));
       more.setOnClickListener(v -> new AlertDialog.Builder(this).setItems(new String[]{"Play", "Edit", "Delete"}, (d, which) -> {
          if (which == 0) this.play(item); else if (which == 1) this.showStreamBookmarkEditor(item);
@@ -2180,16 +2928,21 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       e.setHintTextColor(MUTED);
       e.setHint(hint);
       e.setTextSize(13.0F);
+      e.setMinHeight(this.dp(48));
+      e.setPadding(this.dp(13), this.dp(7), this.dp(13), this.dp(7));
+      GradientDrawable field = this.shape(Color.rgb(24, 20, 33), 12);
+      field.setStroke(this.dp(1), Color.rgb(67, 39, 92));
+      e.setBackground(field);
       return e;
    }
 
-   private void channelsPage(){EditText filter=edit("Search channels");filter.setText(networkSearchQuery);pageBody.addView(filter,lp(-1,dp(42)));LinearLayout results=col();pageBody.addView(results);filter.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence x,int a,int c,int f){}public void onTextChanged(CharSequence x,int a,int before,int count){networkSearchQuery=x.toString();refreshNetworkResults(results,networkSearchQuery);}public void afterTextChanged(Editable x){}});refreshNetworkResults(results,networkSearchQuery);}
+   private void channelsPage(){EditText filter=edit("Search channels");filter.setText(networkSearchQuery);pageBody.addView(filter,lp(-1,dp(48)));LinearLayout results=col();pageBody.addView(results);filter.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence x,int a,int c,int f){}public void onTextChanged(CharSequence x,int a,int before,int count){networkSearchQuery=x.toString();refreshNetworkResults(results,networkSearchQuery);}public void afterTextChanged(Editable x){}});refreshNetworkResults(results,networkSearchQuery);}
    private void settingsPage() {
       this.section("Network", null);
       this.settingRow("Stream", "Open a network stream or channel list", () -> { this.page = "Network Stream"; this.render(); });
       LinearLayout castRow = this.row();
       castRow.setPadding(this.dp(12), this.dp(8), this.dp(12), this.dp(8));
-      castRow.setBackground(this.shape(CARD, 12));
+      castRow.setBackground(this.touchSurface(CARD, 12));
       LinearLayout castInfo = this.col();
       castInfo.addView(this.text("Cast device", 13, Color.WHITE, true));
       castInfo.addView(this.hint("Discover and connect to a TV or speaker"));
@@ -2214,6 +2967,9 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       });
       this.settingRow("Background audio", this.backgroundAudioEnabled ? "Enabled" : "Disabled", () -> this.setBackgroundAudioEnabled(!this.backgroundAudioEnabled));
       this.settingRow("Playback speed", "Change during playback", () -> this.speedDialog());
+      this.section("Player", null);
+      this.section("Gesture Controls", null);
+      this.settingRow("Swap volume and brightness sides", this.gestureSidesSwapped ? "Left: brightness · Right: volume" : "Left: volume · Right: brightness", () -> this.setGestureSidesSwapped(!this.gestureSidesSwapped));
       this.settingRow("Media library", this.library.size() + " visible files", () -> this.ensureMediaPermission());
       this.settingRow("About Solo Player", "Version 1.2.4", () -> {
          (new AlertDialog.Builder(this)).setMessage("Solo Player for Android · LibVLC").setPositiveButton("OK", (DialogInterface.OnClickListener)null).show();
@@ -2222,16 +2978,44 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
 
    private void settingRow(String label, String value, Runnable click) {
       LinearLayout r = this.row();
-      r.setPadding(this.dp(12.0F), this.dp(13.0F), this.dp(12.0F), this.dp(13.0F));
-      r.setBackground(this.shape(CARD, 12));
-      r.addView(this.text(label, 13, -1, true), new LinearLayout.LayoutParams(0, -2, 1.0F));
-      r.addView(this.text(value + "  ›", 11, LILAC, false));
+      r.setPadding(this.dp(14.0F), this.dp(11.0F), this.dp(10.0F), this.dp(11.0F));
+      r.setBackground(this.touchSurface(CARD, 12));
+      r.setMinimumHeight(this.dp(58.0F));
+      LinearLayout detail = this.col();
+      TextView title = this.text(label, 14, Color.WHITE, true);
+      title.setMaxLines(2);
+      title.setEllipsize(TextUtils.TruncateAt.END);
+      detail.addView(title);
+      TextView summary = this.text(value, 12, LILAC, false);
+      summary.setMaxLines(2);
+      summary.setEllipsize(TextUtils.TruncateAt.END);
+      LinearLayout.LayoutParams summaryLp = this.lp(-1, -2);
+      summaryLp.topMargin = this.dp(3.0F);
+      detail.addView(summary, summaryLp);
+      r.addView(detail, new LinearLayout.LayoutParams(0, -2, 1.0F));
+      TextView arrow = this.text("›", 23, MUTED, false);
+      arrow.setGravity(Gravity.CENTER);
+      arrow.setContentDescription("Open " + label);
+      LinearLayout.LayoutParams arrowLp = this.lp(this.dp(36.0F), this.dp(48.0F));
+      arrowLp.leftMargin = this.dp(5.0F);
+      r.addView(arrow, arrowLp);
       LinearLayout.LayoutParams p = this.lp(-1, -2);
-      p.bottomMargin = this.dp(6.0F);
+      p.bottomMargin = this.dp(4.0F);
       this.pageBody.addView(r, p);
+      r.setClickable(true);
+      r.setFocusable(true);
       r.setOnClickListener((v) -> {
          click.run();
       });
+   }
+
+   private void setGestureSidesSwapped(boolean swapped) {
+      this.gestureSidesSwapped = swapped;
+      this.prefs().edit().putBoolean("gesture_sides_swapped", swapped).apply();
+      if (this.fullscreenContainer != null && this.fullscreenContainer.getVisibility() == View.VISIBLE) this.addGestureHuds(this.fullscreenContainer);
+      else if (this.videoFrame != null) this.addGestureHuds(this.videoFrame);
+      this.toast(swapped ? "Gesture sides swapped" : "Gesture sides restored to default");
+      if (this.page.equals("Settings")) this.render();
    }
 
    private void showChannelPicker() {
@@ -2274,11 +3058,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
             LinearLayout row = this.row();
             row.setPadding(this.dp(10.0F), this.dp(10.0F), this.dp(8.0F), this.dp(10.0F));
             boolean selected = this.current != null && channel.uri.equals(this.current.uri);
-            row.setBackground(this.shape(selected ? Color.rgb(47, 15, 72) : CARD, 10));
-            row.addView(this.text("◉", 16, LILAC, true), this.lp(this.dp(34.0F), -2));
+            row.setBackground(this.touchSurface(selected ? Color.rgb(47, 15, 72) : CARD, 10));
+            row.setMinimumHeight(this.dp(54));
+            TextView channelIcon = this.text("◉", 16, LILAC, true);
+            channelIcon.setGravity(Gravity.CENTER);
+            row.addView(channelIcon, this.lp(this.dp(40.0F), this.dp(44.0F)));
             TextView label = this.text(channel.name, 13, Color.WHITE, true);
+            label.setMaxLines(2);
+            label.setEllipsize(TextUtils.TruncateAt.END);
+            label.setPadding(this.dp(8), 0, this.dp(4), 0);
             row.addView(label, new LinearLayout.LayoutParams(0, -2, 1.0F));
-            results.addView(row, this.lp(-1, -2));
+            LinearLayout.LayoutParams channelRowLp = this.lp(-1, -2);
+            channelRowLp.bottomMargin = this.dp(4);
+            results.addView(row, channelRowLp);
             row.setOnClickListener(v -> {
                if (this.current == null || !this.current.network) {
                   dialog.dismiss();
@@ -2326,209 +3118,38 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       pagerParams.bottomMargin = this.dp(10);
       target.addView(pager, pagerParams);
    }
+   /** The legacy portrait player page was removed: every media type now uses the
+    * unified full-screen player built by buildLandscapePlayerUi(). This page only
+    * exists as a brief hand-off while playback is being attached — it keeps a
+    * video surface warm and immediately transitions to the real player UI. */
    private void playerPage() {
       if (this.current == null) {
          this.pageBody.addView(this.hint("Choose a song or video first."));
-      } else {
-         LinearLayout meta = this.row();
-         meta.addView(this.text("‹", 26, -1, true), this.lp(this.dp(38.0F), this.dp(40.0F)));
-         meta.getChildAt(0).setOnClickListener((v) -> {
-            this.closePlayerToHome();
-         });
-         LinearLayout labels = this.col();
-         this.playbackTitle = this.text(this.current.name, 15, -1, true);
-         this.playbackSubtitle = this.text(this.current.video ? "Now Playing (Video)" : "Now Playing (Audio)", 11, MUTED, false);
-         labels.addView(this.playbackTitle);
-         labels.addView(this.playbackSubtitle);
-         meta.addView(labels, new LinearLayout.LayoutParams(0, -2, 1.0F));
-         TextView fav = this.text(this.isFavorite(this.current.uri) ? "♥" : "♡", 22, LILAC, true);
-         meta.addView(fav);
-         fav.setOnClickListener((v) -> {
-            this.toggleFavorite(this.current);
-         });
-         if (this.current.network) {
-            TextView bookmarkStream = this.text("☆", 22, LILAC, true); meta.addView(bookmarkStream);
-            bookmarkStream.setContentDescription("Bookmark this stream");
-            bookmarkStream.setOnClickListener(v -> this.editOrAddCurrentStreamBookmark());
-         }
-         this.pageBody.addView(meta);
-         FrameLayout frame = new FrameLayout(this);
-         this.videoFrame = frame;
-         frame.setBackground(this.shape(-16777216, 16));
-         this.videoSurface = new VLCVideoLayout(this);
-         this.videoSurfaceAttached = false;
-         frame.addView(this.videoSurface, new FrameLayout.LayoutParams(-1, -1));
-         this.videoTapDetector = this.createVideoTapDetector();
-         View tapLayer = new View(this);
-         tapLayer.setBackgroundColor(Color.TRANSPARENT);
-         tapLayer.setOnTouchListener((v, event) -> this.handleVideoTouch(event, frame));
-         frame.addView(tapLayer, new FrameLayout.LayoutParams(-1, -1));
-         this.addGestureHuds(frame);
-         if (this.current.network && playbackStartPending) this.addStreamLoadingOverlay(frame);
-         if (!this.current.video) {
-            FrameLayout audioStage = this.createAudioArtworkStage(this.current, false);
-            frame.addView(audioStage, new FrameLayout.LayoutParams(this.dp(220), this.dp(220), Gravity.CENTER));
-         }
-
-         int videoWidth = this.getResources().getDisplayMetrics().widthPixels - this.dp(28.0F);
-         int availableHeight = this.getResources().getDisplayMetrics().heightPixels;
-         int videoHeight = this.current.video ? Math.max(this.dp(320.0F), Math.min(this.dp(440.0F), Math.round(availableHeight * 0.48F))) : this.dp(220.0F);
-         LinearLayout.LayoutParams fp = this.lp(-1, videoHeight);
-         fp.topMargin = this.dp(12.0F);
-         this.pageBody.addView(frame, fp);
-         if (this.current.network && !this.channels.isEmpty()) {
-            TextView channelSearch = this.button("⌕  Search / switch channel", false);
-            this.pageBody.addView(channelSearch, this.lp(-1, -2));
-            channelSearch.setOnClickListener((v) -> this.showChannelPicker());
-         }
-         LinearLayout videoTools = this.row();
-         this.portraitVideoTools = videoTools;
-         videoTools.setGravity(21);
-         TextView ratioButton = this.button("▭  " + this.aspectMode, false);
-         this.portraitRatioButton = ratioButton;
-         this.bindAspectRatioControl(ratioButton);
-         videoTools.addView(ratioButton);
-         MediaRouteButton portraitCast = this.createCastButton();
-         videoTools.addView(portraitCast, this.lp(this.dp(42), this.dp(42)));
-         TextView pip = this.compactButton("▣", false);
-         pip.setContentDescription("Open floating video window");
-         pip.setOnClickListener(v -> this.enterPlayerPip());
-         videoTools.addView(pip, this.lp(this.dp(42), this.dp(42)));
-         FrameLayout.LayoutParams toolsLp = new FrameLayout.LayoutParams(-2, -2, 53);
-         frame.addView(videoTools, toolsLp);
-         this.applyTranslucentControlBackgrounds(videoTools, 175);
-         frame.setOnClickListener((v) -> {
-            if (this.fullscreen) {
-               this.toggleFullscreen();
-            }
-
-         });
-         if (this.current.video) this.attachVideoSurface(this.videoSurface, this.fullscreen, 0);
-         this.portraitControlsPanel = this.col();
-         this.portraitControlsPanel.setPadding(this.dp(7), this.dp(4), this.dp(7), this.dp(5));
-         this.portraitControlsPanel.setBackground(this.shape(Color.argb(92, 14, 10, 24), 12));
-         this.playbackSeek = new SeekBar(this);
-         this.playbackSeek.setMax(1000);
-         this.playbackSeek.setProgressTintList(ColorStateList.valueOf(PURPLE));
-         this.playbackSeek.setThumbTintList(ColorStateList.valueOf(LILAC));
-         this.portraitControlsPanel.addView(this.playbackSeek);
-         this.playbackSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar s){seeking=true;}public void onStopTrackingTouch(SeekBar s){long length=activePlaybackLength();if(length>0){if(isCasting())seekBy(length*s.getProgress()/1000L-activePlaybackTime());else player.setTime(length*s.getProgress()/1000L);}seeking=false;}public void onProgressChanged(SeekBar s,int p,boolean u){}});
-         this.playbackTime = this.text(this.playbackClock(0L, this.player.getLength()) + "     /     " + this.playbackClock(this.player.getLength(), this.player.getLength()), 11, MUTED, false);
-         this.playbackTime.setGravity(17);
-         this.portraitControlsPanel.addView(this.playbackTime);
-         LinearLayout controls = this.row();
-         controls.setGravity(17);
-         TextView previous = this.compactButton("|◀", false);
-         TextView back = this.compactButton("−10", false);
-         TextView play = this.compactButton(this.isPlaybackActive() ? "❚❚" : "▶", true);
-         this.playbackPlayButton = play;
-         this.setPlaybackButtonIcon(play, this.isPlaybackActive());
-         TextView forward = this.compactButton("+10", false);
-         TextView next = this.compactButton("▶|", false);
-         TextView[] var18 = new TextView[]{previous, back, play, forward, next};
-         int var19 = var18.length;
-
-         for(int var20 = 0; var20 < var19; ++var20) {
-            TextView b = var18[var20];
-            LinearLayout.LayoutParams cp = this.lp(-2, -2);
-            cp.setMargins(this.dp(2.0F), this.dp(3.0F), this.dp(2.0F), this.dp(3.0F));
-            b.setTextSize(12.0F);
-            b.setPadding(this.dp(6.0F), this.dp(4.0F), this.dp(6.0F), this.dp(4.0F));
-            b.setMinHeight(this.dp(36.0F));
-            controls.addView(b, cp);
-         }
-
-         this.portraitControlsPanel.addView(controls);
-         previous.setOnClickListener((v) -> {
-            this.playAdjacent(-1);
-         });
-         next.setOnClickListener((v) -> {
-            this.playAdjacent(1);
-         });
-         back.setOnClickListener((v) -> {
-            this.seekBy(-10000L);
-         });
-         forward.setOnClickListener((v) -> {
-            this.seekBy(10000L);
-         });
-         play.setOnClickListener((v) -> {
-            this.togglePlayback();
-         });
-         LinearLayout advanced = this.col();
-         LinearLayout options = this.row();
-         String[] ops = new String[]{"Speed", "Ratio", "CC", "Audio", "Decode", "Preset"};
-         String[] var31 = ops;
-         int var33 = ops.length;
-
-         for(int var23 = 0; var23 < var33; ++var23) {
-            String op = var31[var23];
-            TextView b = this.compactButton(op, false);
-            LinearLayout.LayoutParams bp = this.lp(0, -2);
-            bp.weight = 1.0F;
-            bp.setMargins(this.dp(5.0F), 0, this.dp(5.0F), 0);
-            options.addView(b, bp);
-            b.setOnClickListener((v) -> {
-               if (op.equals("Speed")) {
-                  this.speedDialog();
-               } else if (op.equals("Ratio")) {
-                  this.cycleAspectMode();
-               } else if (op.equals("Preset")) {
-                  this.showPresetTypeMenu();
-               } else if (op.equals("Decode")) {
-                  this.decoderDialog();
-               } else {
-                  this.showTracks(op.equals("CC"));
-               }
-
-            });
-            if (op.equals("Ratio")) b.setOnLongClickListener(v -> { this.aspectRatioDialog(); return true; });
-         }
-
-         LinearLayout.LayoutParams olp = this.lp(-1, -2);
-         olp.topMargin = this.dp(8.0F);
-         olp.bottomMargin = this.dp(3.0F);
-         advanced.addView(options, olp);
-         LinearLayout volume = this.row();
-         volume.addView(this.text("Vol", 11, MUTED, false), this.lp(this.dp(38.0F), -2));
-         SeekBar vol = new SeekBar(this);
-         vol.setMax(100);
-         vol.setProgress(this.getPlaybackVolumePercent());
-         vol.setProgressTintList(ColorStateList.valueOf(PURPLE));
-         vol.setThumbTintList(ColorStateList.valueOf(LILAC));
-         volume.addView(vol, new LinearLayout.LayoutParams(0, -2, 1.0F));
-         vol.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar s){}public void onStopTrackingTouch(SeekBar s){}public void onProgressChanged(SeekBar s,int p,boolean u){if(u)setPlaybackVolumePercent(p);}});
-         advanced.addView(volume);
-         TextView moreControls = this.compactButton("⌃  Fewer controls", false);
-         moreControls.setTextSize(11.0F);
-         LinearLayout.LayoutParams moreLp = this.lp(-1, this.dp(34.0F));
-         moreLp.topMargin = this.dp(3.0F);
-         this.portraitControlsPanel.addView(moreControls, moreLp);
-         this.portraitControlsPanel.addView(advanced);
-         advanced.setVisibility(View.GONE);
-         moreControls.setText("⌄  More controls");
-         if (this.current.video) {
-            FrameLayout.LayoutParams portraitOverlayLp = new FrameLayout.LayoutParams(-1, -2, 80);
-            portraitOverlayLp.setMargins(this.dp(6), 0, this.dp(6), this.dp(6));
-            frame.addView(this.portraitControlsPanel, portraitOverlayLp);
-         } else {
-            this.pageBody.addView(this.portraitControlsPanel, this.lp(-1, -2));
-         }
-         this.applyTranslucentControlBackgrounds(this.portraitControlsPanel, 165);
-         this.portraitControlsVisible = true;
-         this.portraitControlsPanel.setOnTouchListener((v, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) this.handler.removeCallbacks(this.hidePortraitControls);
-            else if (event.getActionMasked() == MotionEvent.ACTION_UP) this.handler.postDelayed(this.hidePortraitControls, 4000L);
-            return false;
-         });
-         this.handler.removeCallbacks(this.hidePortraitControls);
-         this.handler.postDelayed(this.hidePortraitControls, 4000L);
-         moreControls.setOnClickListener((v) -> {
-            boolean open = advanced.getVisibility() != 0;
-            advanced.setVisibility(open ? 0 : 8);
-            moreControls.setText(open ? "⌃  Fewer controls" : "⌄  More controls");
-         });
+         return;
       }
+      if (this.videoSurface == null) this.videoSurface = new VLCVideoLayout(this);
+      TextView opening = this.hint("Opening player…");
+      LinearLayout.LayoutParams hintLp = this.lp(-1, -2);
+      hintLp.topMargin = this.dp(120);
+      this.pageBody.addView(opening, hintLp);
+      this.handler.post(this::openPlayerUi);
    }
+
+   /** Single entry point that guarantees the unified player UI is shown for any
+    * media type. Retries briefly while media is still being attached so the old
+    * portrait page can never reappear. */
+   private void openPlayerUi() {
+      if (this.current == null || this.fullscreen) { this.openPlayerRetries = 0; return; }
+      if (this.player == null || !this.player.hasMedia()) {
+         if (this.openPlayerRetries++ < 50) this.handler.postDelayed(this::openPlayerUi, 120L);
+         return;
+      }
+      this.openPlayerRetries = 0;
+      this.pendingAutoFullscreen = false;
+      if (this.videoSurface == null) this.videoSurface = new VLCVideoLayout(this);
+      this.toggleFullscreen();
+   }
+
 
    private void mediaRow(MediaItem m, boolean playable) {
       this.mediaRow(m, playable, null);
@@ -2537,7 +3158,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private void mediaRow(MediaItem m, boolean playable, ArrayList<MediaItem> sourceQueue) {
       LinearLayout r = this.row();
       r.setPadding(this.dp(9.0F), this.dp(8.0F), this.dp(9.0F), this.dp(8.0F));
-      r.setBackground(this.shape(CARD, 13));
+      r.setBackground(this.touchSurface(CARD, 13));
       ImageView icon = new ImageView(this);
       icon.setImageResource(R.drawable.solo_player_logo);
       icon.setScaleType(ScaleType.CENTER_CROP);
@@ -2547,18 +3168,34 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.loadArtwork(m, icon);
       LinearLayout meta = this.col();
       meta.setPadding(this.dp(9.0F), 0, this.dp(4.0F), 0);
-      meta.addView(this.text(m.name, 12, -1, true));
+      TextView title = this.text(m.name, 13, -1, true);
+      title.setMaxLines(2);
+      title.setEllipsize(TextUtils.TruncateAt.END);
+      meta.addView(title);
       String sub = m.video ? (m.path.isEmpty() ? "Local video" : m.path) + (m.size > 0L ? " · " + this.fileSize(m.size) : "") + (m.duration > 0L ? " · " + this.clock(m.duration) : "") : (!m.artist.isEmpty() ? m.artist : "Audio") + (m.duration > 0L ? " · " + this.clock(m.duration) : "");
       if (m.positionMs > 0L) sub += " · Resume " + this.clock(m.positionMs);
-      meta.addView(this.text(sub, 10, MUTED, false));
+      TextView subtitle = this.text(sub, 11, MUTED, false);
+      subtitle.setSingleLine(true);
+      subtitle.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+      meta.addView(subtitle);
       r.addView(meta, new LinearLayout.LayoutParams(0, -2, 1.0F));
       TextView more = this.text("⋮", 20, MUTED, true);
+      more.setGravity(Gravity.CENTER);
+      more.setMinWidth(this.dp(40));
+      more.setMinHeight(this.dp(48));
+      more.setContentDescription("More actions for " + m.name);
+      if (this.mediaSelectionMode && this.selectedMediaUris.contains(m.uri)) {
+         r.setBackground(this.shape(Color.rgb(55, 24, 82), 13));
+         more.setText("✓"); more.setTextColor(LILAC);
+      }
       r.addView(more);
       LinearLayout.LayoutParams p = this.lp(-1, -2);
       p.bottomMargin = this.dp(6.0F);
       this.pageBody.addView(r, p);
       r.setOnClickListener((v) -> {
-         if (m.folder) {
+          if (this.mediaSelectionMode && !m.folder) {
+             this.toggleMediaSelection(m, r, more);
+          } else if (m.folder) {
             this.activeFolder = m.path;
             this.page = "Folder";
             this.render();
@@ -2575,31 +3212,59 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
 
       });
+      r.setOnLongClickListener(v -> {
+         if (m.folder) return false;
+         if (!this.mediaSelectionMode) this.mediaSelectionMode = true;
+         this.toggleMediaSelection(m, r, more);
+         return true;
+      });
       more.setOnClickListener((v) -> {
-         this.mediaMenu(m);
+          this.mediaMenu(m, r, more);
       });
    }
 
+   private void toggleMediaSelection(MediaItem item, LinearLayout row, TextView action) {
+      if (this.selectedMediaUris.contains(item.uri)) this.selectedMediaUris.remove(item.uri);
+      else this.selectedMediaUris.add(item.uri);
+      if (this.selectedMediaUris.isEmpty()) this.mediaSelectionMode = false;
+      boolean selected = this.selectedMediaUris.contains(item.uri);
+      if (row != null) row.setBackground(this.shape(selected ? Color.rgb(55, 24, 82) : CARD, 13));
+      if (action != null) { action.setText(this.mediaSelectionMode && selected ? "✓" : "⋮"); action.setTextColor(selected ? LILAC : MUTED); }
+      if (!this.selectedMediaUris.isEmpty()) this.toast(this.selectedMediaUris.size() + " selected · tap ⋮ for actions");
+   }
+
    private FrameLayout createAudioArtworkStage(MediaItem media, boolean expanded) {
+      return this.createAudioArtworkStage(media, expanded, null);
+   }
+
+   private FrameLayout createAudioArtworkStage(MediaItem media, boolean expanded, ImageView ambient) {
       FrameLayout stage = new FrameLayout(this); stage.setClipChildren(false); stage.setClipToPadding(false); stage.setClickable(false);
       AudioArtworkEffectView effect = new AudioArtworkEffectView(this, PURPLE, LILAC); effect.setPlaying(this.current != null && !this.current.video && this.isPlaybackActive());
+      if (expanded) effect.setShowBars(false);
       stage.addView(effect, new FrameLayout.LayoutParams(-1, -1));
       ImageView art = new ImageView(this); art.setImageResource(R.drawable.solo_player_logo); art.setScaleType(ScaleType.CENTER_CROP);
-      art.setBackground(this.shape(Color.rgb(24, 12, 34), 16)); art.setClipToOutline(true); art.setClickable(false);
-      int imageSize = this.dp(expanded ? 172 : 142); FrameLayout.LayoutParams artLp = new FrameLayout.LayoutParams(imageSize, imageSize, Gravity.TOP | Gravity.CENTER_HORIZONTAL); artLp.topMargin = this.dp(expanded ? 12 : 10);
-      stage.addView(art, artLp); this.loadArtwork(media, art);
+      GradientDrawable frame = this.shape(Color.rgb(24, 12, 34), 20);
+      frame.setStroke(this.dp(1.5F), LILAC);
+      art.setBackground(frame); art.setClipToOutline(true); art.setClickable(false);
+      int imageSize = this.dp(expanded ? 200 : 142); FrameLayout.LayoutParams artLp = new FrameLayout.LayoutParams(imageSize, imageSize, expanded ? Gravity.CENTER : Gravity.TOP | Gravity.CENTER_HORIZONTAL); artLp.topMargin = expanded ? 0 : this.dp(10);
+      stage.addView(art, artLp); this.loadArtwork(media, art, ambient);
       if (expanded) { this.fullscreenArtwork = art; this.fullscreenArtworkEffect = effect; }
       else { this.playbackArtwork = art; this.playbackArtworkEffect = effect; }
       return stage;
    }
 
    private void loadArtwork(MediaItem m, ImageView target) {
+      this.loadArtwork(m, target, null);
+   }
+
+   private void loadArtwork(MediaItem m, ImageView target, ImageView ambient) {
       Uri uri = Uri.parse(m.uri);
       this.thumbnailWorker.execute(() -> {
          Bitmap art = null;
 
          try {
-            if (m.video && VERSION.SDK_INT >= 29) {
+            if (!m.logo.isEmpty() && m.logo.startsWith("http")) art = OnlineArtwork.fetch(m.logo);
+            if (art == null) if (m.video && VERSION.SDK_INT >= 29) {
                art = this.getContentResolver().loadThumbnail(uri, new Size(this.dp(160.0F), this.dp(160.0F)), (CancellationSignal)null);
             } else {
                MediaMetadataRetriever retriever = new MediaMetadataRetriever();
@@ -2625,12 +3290,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
             this.runOnUiThread(() -> {
                if (!this.isFinishing()) {
                   target.setImageBitmap(bitmap);
+                  if (ambient != null) ambient.setImageBitmap(this.ambientBlur(bitmap));
                }
 
             });
          }
 
       });
+   }
+
+   /** Tiny downscaled copy of the artwork; the full-screen ImageView stretches
+    * it back up, which produces a soft ambient blur for free. */
+   private static Bitmap ambientBlur(Bitmap src) {
+      return Bitmap.createScaledBitmap(src, 28, 28, true);
    }
 
    private String fileSize(long n) {
@@ -2641,8 +3313,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       }
    }
 
-   private void mediaMenu(MediaItem m) {
-      String[] options = new String[]{"Play now", "Add to queue", this.isFavorite(m.uri) ? "Remove favorite" : "Add to favorites", "Add to playlist"};
+   private void mediaMenu(MediaItem m, LinearLayout row, TextView moreButton) {
+      if (this.mediaSelectionMode && !this.selectedMediaUris.isEmpty()) {
+         ArrayList<MediaItem> selected = this.getSelectedMediaItems();
+         String[] bulk = new String[]{"Play selected (" + selected.size() + ")", "Delete selected", "Cut selected", "Clear selection"};
+         new AlertDialog.Builder(this).setTitle(selected.size() + " media selected").setItems(bulk, (d, w) -> {
+            if (w == 0) this.playSelectedMedia(selected);
+            else if (w == 1) this.confirmDeleteMedia(selected);
+            else if (w == 2) this.chooseCutDestination(selected);
+            else { this.selectedMediaUris.clear(); this.mediaSelectionMode = false; this.pageViewCache.clear(); this.attachedPageCacheKey = null; this.render(); }
+         }).setNegativeButton("Cancel", null).show();
+         return;
+      }
+      String[] options = new String[]{"Play now", "Add to queue", this.isFavorite(m.uri) ? "Remove favorite" : "Add to favorites", "Add to playlist", "Delete", "Cut to folder…", "Select multiple files"};
       (new AlertDialog.Builder(this)).setItems(options, (d, w) -> {
          if (w == 0) {
             this.play(m);
@@ -2654,9 +3337,126 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
             this.toggleFavorite(m);
          } else if(w==3) {
             this.addToPlaylist(m);
+          } else if (w == 4) {
+             ArrayList<MediaItem> one = new ArrayList<>(); one.add(m); this.confirmDeleteMedia(one);
+          } else if (w == 5) {
+             ArrayList<MediaItem> one = new ArrayList<>(); one.add(m); this.chooseCutDestination(one);
+          } else if (w == 6) {
+             this.selectedMediaUris.clear(); this.selectedMediaUris.add(m.uri); this.mediaSelectionMode = true;
+             row.setBackground(this.shape(Color.rgb(55, 24, 82), 13)); moreButton.setText("✓"); moreButton.setTextColor(LILAC);
+             this.toast("1 selected · select more files, then tap ⋮");
          }
 
       }).show();
+   }
+
+   private ArrayList<MediaItem> getSelectedMediaItems() {
+      ArrayList<MediaItem> items = new ArrayList<>();
+      for (MediaItem item : this.library) if (this.selectedMediaUris.contains(item.uri)) items.add(item);
+      return items;
+   }
+
+   private void playSelectedMedia(ArrayList<MediaItem> items) {
+      if (items == null || items.isEmpty()) { this.toast("Select at least one media file"); return; }
+      this.queue.clear(); this.queue.addAll(items);
+      this.selectedMediaUris.clear(); this.mediaSelectionMode = false;
+      this.play(items.get(0));
+   }
+
+   private void confirmDeleteMedia(ArrayList<MediaItem> items) {
+      if (items == null || items.isEmpty()) return;
+      new AlertDialog.Builder(this).setTitle("Delete " + items.size() + " file(s)?")
+         .setMessage("This permanently deletes the selected files from device storage.")
+         .setNegativeButton("Cancel", null).setPositiveButton("Delete", (d, w) -> this.deleteMediaItems(items, false)).show();
+   }
+
+   private void chooseCutDestination(ArrayList<MediaItem> items) {
+      if (items == null || items.isEmpty()) return;
+      this.pendingFileOperationItems.clear(); this.pendingFileOperationItems.addAll(items);
+      Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+      picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+      try { this.startActivityForResult(picker, PICK_CUT_DESTINATION); }
+      catch (Exception error) { this.pendingFileOperationItems.clear(); this.toast("Could not open the folder picker"); }
+   }
+
+   private void copySelectedToFolder(Uri tree) {
+      ArrayList<MediaItem> items = new ArrayList<>(this.pendingFileOperationItems);
+      this.pendingFileOperationItems.clear();
+      if (items.isEmpty() || tree == null) return;
+      try { this.getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION); }
+      catch (Exception ignored) {}
+      ProgressDialog progress = new ProgressDialog(this); progress.setTitle("Moving media"); progress.setMessage("Copying selected files…"); progress.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL); progress.setMax(items.size()); progress.setProgress(0); progress.setCancelable(false); progress.show();
+      this.worker.execute(() -> {
+         ArrayList<Uri> copies = new ArrayList<>(); String failure = null;
+         try {
+            Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+            for (int i = 0; i < items.size(); i++) {
+               MediaItem item = items.get(i); Uri source = Uri.parse(item.uri); String mime = this.getContentResolver().getType(source); if (mime == null) mime = "application/octet-stream";
+               Uri destination = DocumentsContract.createDocument(this.getContentResolver(), parent, mime, item.name);
+               if (destination == null) throw new IOException("Could not create " + item.name + " in the selected folder");
+               copies.add(destination);
+               try (InputStream in = this.getContentResolver().openInputStream(source); OutputStream out = this.getContentResolver().openOutputStream(destination, "w")) {
+                  if (in == null || out == null) throw new IOException("Could not open " + item.name);
+                  byte[] buffer = new byte[64 * 1024]; int count; while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count); out.flush();
+               }
+               final int done = i + 1; this.handler.post(() -> { if (progress.isShowing()) progress.setProgress(done); });
+            }
+         } catch (Exception error) { failure = error.getMessage() == null ? "Copy failed" : error.getMessage(); }
+         final String problem = failure; final ArrayList<Uri> completed = copies;
+         this.handler.post(() -> {
+            if (progress.isShowing()) progress.dismiss();
+            if (problem != null) { this.deleteDestinationCopies(completed); this.toast("Move cancelled: " + problem); return; }
+            this.pendingCutCopies.clear(); this.pendingCutCopies.addAll(completed);
+            this.deleteMediaItems(items, true);
+         });
+      });
+   }
+
+   private void deleteDestinationCopies(ArrayList<Uri> copies) {
+      if (copies == null) return;
+      for (Uri uri : copies) try { DocumentsContract.deleteDocument(this.getContentResolver(), uri); } catch (Exception ignored) {}
+   }
+
+   private void deleteMediaItems(ArrayList<MediaItem> items, boolean cut) {
+      if (items == null || items.isEmpty()) return;
+      this.pendingFileOperationItems.clear(); this.pendingFileOperationItems.addAll(items); this.pendingCutDelete = cut; this.pendingLegacyDeleteIndex = 0;
+      if (VERSION.SDK_INT >= 30) {
+         ArrayList<Uri> uris = new ArrayList<>(); for (MediaItem item : items) uris.add(Uri.parse(item.uri));
+         try { PendingIntent request = MediaStore.createDeleteRequest(this.getContentResolver(), uris); this.startIntentSenderForResult(request.getIntentSender(), CONFIRM_MEDIA_DELETE, null, 0, 0, 0); }
+         catch (Exception error) { this.finishFileDelete(false, "Android could not open the delete confirmation"); }
+      } else if (VERSION.SDK_INT < 29 && VERSION.SDK_INT >= 23 && this.checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED) {
+         this.requestPermissions(new String[]{"android.permission.WRITE_EXTERNAL_STORAGE"}, REQUEST_STORAGE_DELETE_PERMISSION);
+      } else this.deleteLegacyMediaItems();
+   }
+
+   private void deleteLegacyMediaItems() {
+      while (this.pendingLegacyDeleteIndex < this.pendingFileOperationItems.size()) {
+         MediaItem item = this.pendingFileOperationItems.get(this.pendingLegacyDeleteIndex);
+         try { int count = this.getContentResolver().delete(Uri.parse(item.uri), null, null); if (count <= 0) throw new IOException("Android did not delete " + item.name); this.pendingLegacyDeleteIndex++; }
+         catch (android.app.RecoverableSecurityException recoverable) {
+            try { this.startIntentSenderForResult(recoverable.getUserAction().getActionIntent().getIntentSender(), CONFIRM_MEDIA_DELETE, null, 0, 0, 0); }
+            catch (Exception error) { this.finishFileDelete(false, "Delete permission could not be requested"); }
+            return;
+         } catch (Exception error) { this.finishFileDelete(false, error.getMessage() == null ? "Delete failed" : error.getMessage()); return; }
+      }
+      this.finishFileDelete(true, null);
+   }
+
+   private void finishFileDelete(boolean success, String problem) {
+      if (!success && this.pendingCutDelete) this.deleteDestinationCopies(new ArrayList<>(this.pendingCutCopies));
+      int count = this.pendingFileOperationItems.size();
+      if (success) {
+         for (MediaItem item : this.pendingFileOperationItems) this.selectedMediaUris.remove(item.uri);
+         HashSet<String> removedUris = new HashSet<>(); for (MediaItem item : this.pendingFileOperationItems) removedUris.add(item.uri);
+         this.library.removeIf(item -> removedUris.contains(item.uri));
+         this.recentPlayed.removeIf(item -> removedUris.contains(item.uri));
+         queue.removeIf(item -> removedUris.contains(item.uri));
+         this.mediaSelectionMode = !this.selectedMediaUris.isEmpty();
+         this.lastLibraryScanAt = 0L; this.saveData(); this.scanLibrary();
+         this.toast(this.pendingCutDelete ? "Moved " + count + " file(s)" : "Deleted " + count + " file(s)");
+      } else this.toast((this.pendingCutDelete ? "Move" : "Delete") + " failed: " + problem + (this.pendingCutDelete ? " · originals were kept" : ""));
+      this.pendingCutCopies.clear(); this.pendingFileOperationItems.clear(); this.pendingCutDelete = false;
+      this.render();
    }
 
    private void mediaGridButton(String label, String glyph, String dest) {
@@ -2748,6 +3548,15 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.toast("This channel has no playable stream URL");
          return;
       }
+      if (item.uri.startsWith("ytm:")) {
+         String key = this.onlineVideoId(item);
+         String cached = this.onlineResolvedUrls.get(key);
+         if (cached == null || !this.resolvedOnlineFileExists(cached)) {
+            this.onlineResolvedUrls.remove(key);
+            this.resolveOnlineItem(item);
+            return;
+         }
+      }
       if (this.player == null || this.vlc == null) {
          this.toast("The media player is not ready. Please try again.");
          return;
@@ -2781,7 +3590,13 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
             this.activeMediaFd = null;
          }
 
-         Uri source = Uri.parse(item.uri);
+         String playableUri = item.uri;
+         if (playableUri.startsWith("ytm:")) {
+            String resolved = this.onlineResolvedUrls.get(this.onlineVideoId(item));
+            if (resolved == null) throw new IOException("Online track has not been resolved yet");
+            playableUri = resolved;
+         }
+         Uri source = Uri.parse(playableUri);
          Media media;
          if ("content".equalsIgnoreCase(source.getScheme()) && !item.network) {
             this.activeMediaFd = this.getContentResolver().openAssetFileDescriptor(source, "r");
@@ -2797,7 +3612,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          media.setHWDecoderEnabled(this.decoderMode != 1, this.decoderMode == 2);
          if (item.video && item.uri.equals(externalSubtitleMediaUri) && !externalSubtitlePath.isEmpty()) media.addOption(":sub-file=" + externalSubtitlePath);
          media.addOption(":network-caching=" + this.networkCache);
-         if (item.network) {
+         if (item.network || !item.tvgId.isEmpty()) {
             if (!item.agent.isEmpty()) {
                media.addOption(":http-user-agent=" + this.clean(item.agent));
             }
@@ -2850,7 +3665,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
          this.applyAspectRatio();
          this.syncPlaybackUi();
-         if (!this.fullscreen && !this.pendingAutoFullscreen) this.toggleFullscreen();
+         if (!this.fullscreen && !this.pendingAutoFullscreen) this.openPlayerUi();
          if (this.currentIsVideo()) this.applyOrientationMode();
       } catch (Exception var5) {
          this.handler.removeCallbacks(this.streamConnectionTimeout);
@@ -2869,7 +3684,17 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       int index = -1;
       for (int i = 0; i < this.queue.size(); i++) if (this.queue.get(i).uri.equals(this.current.uri)) { index = i; break; }
       if (index < 0) return;
+      if (this.shuffleEnabled && delta > 0 && this.queue.size() > 2) {
+         int pick;
+         do { pick = new java.util.Random().nextInt(this.queue.size()); } while (pick == index);
+         this.play(this.queue.get(pick));
+         return;
+      }
       int next = index + delta;
+      if (this.repeatMode == 1) {
+         if (next >= this.queue.size()) next = 0;
+         else if (next < 0) next = this.queue.size() - 1;
+      }
       if (next >= 0 && next < this.queue.size()) this.play(this.queue.get(next));
    }
 
@@ -2927,6 +3752,11 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    private void syncAudioService() {
       if (this.isBackgroundAudioSession()) {
          AudioPlaybackService.startOrUpdate(this.getApplicationContext(), current.name, this.isPlaybackActive());
+         if (VERSION.SDK_INT >= 33 && !this.notificationPermissionPrompted
+               && this.checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            this.notificationPermissionPrompted = true;
+            this.requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQUEST_POST_NOTIFICATIONS);
+         }
       }
    }
 
@@ -2938,6 +3768,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       boolean animateAudio = this.current != null && !this.current.video && playing;
       if (this.playbackArtworkEffect != null) this.playbackArtworkEffect.setPlaying(animateAudio);
       if (this.fullscreenArtworkEffect != null) this.fullscreenArtworkEffect.setPlaying(animateAudio);
+      if (this.audioWaveBackdrop != null) this.audioWaveBackdrop.setPlaying(animateAudio);
    }
 
    private void setPlaybackButtonIcon(TextView button, boolean playing) {
@@ -2959,6 +3790,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.syncPlaybackButtons();
       this.updateMini();
       this.syncAudioService();
+      this.publishMediaSessionState();
       if (VERSION.SDK_INT >= 26 && this.currentIsVideo() && this.videoSurface != null) this.updatePipParams(true);
    }
 
@@ -2968,6 +3800,13 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    static void refreshRetainedPlaybackUi() {
       MainActivity activity = activeActivity;
       if (activity != null) activity.handler.post(() -> { activity.syncPlaybackButtons(); activity.updateMini(); });
+   }
+
+   /** Headset next/previous while the activity is backgrounded — the service's
+    * media session calls this so queue skipping still works. */
+   static void skipRetainedAdjacent(int delta) {
+      MainActivity activity = activeActivity;
+      if (activity != null) activity.handler.post(() -> activity.playAdjacent(delta));
    }
 
    static void stopRetainedAudio() {
@@ -3072,12 +3911,25 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
             playbackStartPending = false;
             playbackRequested = false;
             if (this.current != null) this.setRecentPosition(this.current.uri, 0L, Math.max(0L, this.player.getLength()));
-            this.playAdjacent(1);
+            if (this.repeatMode == 2 && this.current != null) this.play(this.current);
+            else this.playAdjacent(1);
             break;
          case 266:
             playbackStartPending = false;
             playbackRequested = false;
-            if (this.current != null && this.current.network) this.showNetworkStreamFailure(this.playbackErrorMessage());
+            if (this.current != null && this.current.uri != null && this.current.uri.startsWith("ytm:")) {
+               long now = android.os.SystemClock.elapsedRealtime();
+               if (now - this.lastOnlineRetryAt > 20000L) {
+                  this.lastOnlineRetryAt = now;
+                  this.saveCurrentResumePosition();
+                  this.onlineResolvedUrls.remove(this.current.uri.substring(4));
+                  this.setStreamLoading(true, "Reconnecting online track…");
+                  this.resolveOnlineItem(this.current);
+                  break;
+               }
+               this.syncPlaybackUi();
+               this.toast(this.playbackErrorMessage());
+            } else if (this.current != null && this.current.network) this.showNetworkStreamFailure(this.playbackErrorMessage());
             else { this.syncPlaybackUi(); this.toast(this.playbackErrorMessage()); }
       }
 
@@ -3108,16 +3960,25 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       if(this.pausedFrameOverlay!=null&&this.player!=null&&this.isPlaybackActive()&&this.player.getTime()>this.pausedFramePosition+80L)this.clearPausedFrameOverlay();
       long d;
       long p;
-      if (this.fullscreen && this.player != null && this.fullscreenSeek != null) {
+      if (this.fullscreen && this.player != null && (this.fullscreenSeek != null || this.fullscreenVideoSeek != null)) {
          d = this.activePlaybackLength();
          p = this.activePlaybackTime();
          this.applyAbRepeatIfNeeded(p);
          if (!this.seeking && d > 0L) {
-            this.fullscreenSeek.setProgress((int)(1000L * p / d));
+            int progress = (int)(1000L * p / d);
+            if (this.fullscreenSeek != null) this.fullscreenSeek.setProgress(progress);
+            if (this.fullscreenVideoSeek != null) this.fullscreenVideoSeek.setProgress(progress);
          }
 
          if (this.fullscreenTime != null) {
-            this.fullscreenTime.setText(this.playbackClock(p, d) + "  /  " + this.playbackClock(d, d));
+            if (this.currentIsVideo()) {
+               this.fullscreenTime.setText(this.playbackClock(p, d) + "  /  " + this.playbackClock(d, d));
+            } else {
+               this.fullscreenTime.setText(this.playbackClock(p, d));
+            }
+         }
+         if (this.fullscreenDuration != null) {
+            this.fullscreenDuration.setText(this.playbackClock(d, d));
          }
       } else if (this.page.equals("Player") && this.player != null && this.playbackSeek != null) {
          d = this.activePlaybackLength();
@@ -3964,6 +4825,13 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          }
 
       }
+      if (code == REQUEST_STORAGE_DELETE_PERMISSION) {
+         if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) this.deleteLegacyMediaItems();
+         else this.finishFileDelete(false, "storage write permission was declined");
+      }
+      if (code == REQUEST_POST_NOTIFICATIONS && (results.length == 0 || results[0] != PackageManager.PERMISSION_GRANTED)) {
+         this.toast("Background audio is active; allow notifications to show lock-screen and playback controls");
+      }
    }
 
    public void onConfigurationChanged(Configuration config) {
@@ -4423,6 +5291,17 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          if(result==RESULT_OK&&data!=null){ArrayList<Uri> selected=new ArrayList<>();try{int flags=data.getFlags()&(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);if(data.getClipData()!=null){for(int i=0;i<data.getClipData().getItemCount();i++){Uri uri=data.getClipData().getItemAt(i).getUri();selected.add(uri);try{this.getContentResolver().takePersistableUriPermission(uri,flags);}catch(Exception ignored){}}}else if(data.getData()!=null){Uri uri=data.getData();selected.add(uri);try{this.getContentResolver().takePersistableUriPermission(uri,flags);}catch(Exception ignored){}}}catch(Exception error){this.toast("Could not prepare selected media: "+error.getMessage());}this.askPrivateImportMode(selected,this.privateMediaPath);}else this.render();
          return;
       }
+      if (code == PICK_CUT_DESTINATION) {
+         if (result == RESULT_OK && data != null && data.getData() != null) this.copySelectedToFolder(data.getData());
+         else { this.pendingFileOperationItems.clear(); this.toast("Move cancelled; selected files were not changed"); }
+         return;
+      }
+      if (code == CONFIRM_MEDIA_DELETE) {
+         if (VERSION.SDK_INT >= 30) this.finishFileDelete(result == RESULT_OK, result == RESULT_OK ? null : "permission was declined");
+         else if (result == RESULT_OK) this.deleteLegacyMediaItems();
+         else this.finishFileDelete(false, "permission was declined");
+         return;
+      }
       if(code==MOVE_PRIVATE_MEDIA){
          if(result==RESULT_OK){for(String id:new ArrayList<>(this.pendingPrivateMoveIds)){JSONObject entry=this.privateVideoEntry(id);if(entry!=null)try{entry.put("sourceDeleted",true);}catch(Exception ignored){}}this.savePrivateVideos();this.lastLibraryScanAt=0L;this.scanLibrary();this.render();this.toast("Original media removed from shared storage and encrypted in Private Media");}
          else {for(String id:new ArrayList<>(this.pendingPrivateMoveIds))this.removePrivateVaultRecordOnly(id);this.savePrivateVideos();this.lastLibraryScanAt=0L;this.scanLibrary();this.render();this.toast("Move cancelled. Original files were left unchanged.");}
@@ -4649,36 +5528,21 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       if (this.exitPromptPending) return;
       if (this.fullscreen && this.fullscreenDrawer != null && this.fullscreenDrawer.getVisibility() == 0) {
          this.toggleFullscreenDrawer();
-      } else if (!this.fullscreen && !this.page.equals("Player")) {
-         if (this.page.equals("Settings")) {
-            this.page = this.previousPage.equals("Settings") ? "Home" : this.previousPage;
-            this.render();
-         } else if (this.page.equals("Folder")) {
-            this.page = "Folders";
-            this.render();
-         } else if (this.page.equals("Folders")) {
-            this.page = "More";
-            this.render();
-         } else if (this.page.equals("Playlist")) {
-            this.page = "Playlists";
-            this.render();
-         } else if (this.page.equals("Channels")) {
-            this.page = "Network Stream";
-            this.render();
-         } else if (this.page.equals("Network Stream")) {
-            this.stopPlaybackSession();
-            this.page = "Home";
-            this.render();
-         } else if (!this.page.equals("Home")) {
-            this.page = "Home";
-            this.render();
-         } else {
-            if (this.isBackgroundAudioSession()) this.syncAudioService(); else this.stopPlaybackSession();
-            this.finish();
-         }
-      } else {
-         this.closePlayerToHome();
+         return;
       }
+      if (this.fullscreen || this.page.equals("Player")) {
+         this.closePlayerToHome();
+         return;
+      }
+      if (this.page.equals("Music") && this.musicMode.equals("Go Online") && this.onlineView.equals("detail")) {
+         this.onlineView = "home";
+         this.render();
+         return;
+      }
+      if (this.page.equals("Network Stream") || this.page.equals("Channels")) this.stopPlaybackSession();
+      if (this.restorePreviousNavState()) return;
+      if (this.isBackgroundAudioSession()) this.syncAudioService(); else this.stopPlaybackSession();
+      this.finish();
    }
 
    public void onBackPressed() {
@@ -4719,10 +5583,19 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.fullscreenChapters = null;
          this.fullscreenTools = null;
          this.fullscreenSeek = null;
+         this.fullscreenVideoSeek = null;
          this.fullscreenTime = null;
+         this.fullscreenDuration = null;
+         this.fullscreenAmbient = null;
+         this.fullscreenShuffleButton = null;
+         this.fullscreenArtist = null;
          this.fullscreenTitle = null;
          this.fullscreenArtwork = null;
          this.fullscreenArtworkEffect = null;
+         this.fullscreenHeaderTitle = null;
+         this.fullscreenHeaderArtist = null;
+         this.fullscreenRepeatButton = null;
+         this.audioWaveBackdrop = null;
          this.fullscreenAudioTools = null;
          this.fullscreenVideoTools = null;
          this.fullscreenSubtitleTools = null;
@@ -4745,8 +5618,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.saveCurrentResumePosition();
       if (this.isBackgroundAudioSession()) {
          this.exitFullscreenUi();
-         this.page = "Home";
-         this.render();
+         if (!this.restorePreviousNavState()) { this.page = "Home"; this.render(); }
          this.updateMini();
          this.syncAudioService();
          return;
@@ -4783,8 +5655,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.exitPromptPending = false;
       this.exitFullscreenUi();
       this.stopPlaybackSession();
-      this.page = "Home";
-      this.render();
+      if (!this.restorePreviousNavState()) { this.page = "Home"; this.render(); }
    }
 
    private void stopPlaybackSession() {
@@ -4853,6 +5724,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       super.onStart();
       this.activityStarted = true;
       activeActivity = this;
+      if (this.mediaSession != null) { this.mediaSession.setActive(true); this.publishMediaSessionState(); }
+      this.registerBecomingNoisyReceiver();
       if (this.castContext != null) {
          try {
             SessionManager manager = this.castContext.getSessionManager();
@@ -4888,6 +5761,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       if (this.castContext != null) {
          try { this.castContext.getSessionManager().removeSessionManagerListener(this.castSessionListener, CastSession.class); } catch (Exception ignored) {}
       }
+      this.unregisterBecomingNoisyReceiver();
+      if (this.mediaSession != null) this.mediaSession.setActive(false);
       if (this.isBackgroundAudioSession()) {
          this.syncAudioService();
       } else if (!preserveVideoForReturn && !this.pickerOpen && !this.isChangingConfigurations() && this.player != null && this.player.hasMedia()) {
@@ -4973,6 +5848,11 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          TextView button = dialog.getButton(id);
          if (button != null) button.setTextColor(LILAC);
       }
+      int screenWidth = this.getResources().getDisplayMetrics().widthPixels;
+      boolean wide = this.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+      int dialogWidth = Math.min(this.dp(560), Math.round(screenWidth * (wide ? 0.76F : 0.92F)));
+      dialog.getWindow().setLayout(dialogWidth, WindowManager.LayoutParams.WRAP_CONTENT);
+      dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
    }
 
    private void aspectRatioDialog() {
@@ -5148,19 +6028,20 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       }
       if (this.fullscreenOverlay != null && this.fullscreenOverlay.getLayoutParams() instanceof FrameLayout.LayoutParams) {
          FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams)this.fullscreenOverlay.getLayoutParams();
-         lp.setMargins(left, 0, right, bottom);
+         int audioTop = !this.currentIsVideo() ? this.dp(this.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 60.0F : 88.0F) : 0;
+         lp.setMargins(left, audioTop, right, bottom);
          this.fullscreenOverlay.setLayoutParams(lp);
       }
-      if (this.brightnessHud != null && this.brightnessHud.getLayoutParams() instanceof FrameLayout.LayoutParams) {
-         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams)this.brightnessHud.getLayoutParams();
-         lp.leftMargin = left + this.dp(10);
-         this.brightnessHud.setLayoutParams(lp);
-      }
-      if (this.volumeHud != null && this.volumeHud.getLayoutParams() instanceof FrameLayout.LayoutParams) {
-         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams)this.volumeHud.getLayoutParams();
-         lp.rightMargin = right + this.dp(10);
-         this.volumeHud.setLayoutParams(lp);
-      }
+      this.applyGestureHudInset(this.brightnessHud, left, right);
+      this.applyGestureHudInset(this.volumeHud, left, right);
+   }
+
+   private void applyGestureHudInset(View hud, int left, int right) {
+      if (hud == null || !(hud.getLayoutParams() instanceof FrameLayout.LayoutParams)) return;
+      FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams)hud.getLayoutParams();
+      boolean onLeft = (lp.gravity & Gravity.HORIZONTAL_GRAVITY_MASK) == Gravity.LEFT;
+      if (onLeft) lp.leftMargin = left + this.dp(10); else lp.rightMargin = right + this.dp(10);
+      hud.setLayoutParams(lp);
    }
 
    private boolean currentIsVideo() {
@@ -5214,15 +6095,31 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
    }
 
    private void buildLandscapePlayerUi(VLCVideoLayout surface) {
+      boolean isAudio = !this.current.video;
+      this.fullscreenArtwork = null;
+      this.fullscreenArtworkEffect = null;
+      this.fullscreenSeek = null;
+      this.fullscreenVideoSeek = null;
+      this.audioWaveBackdrop = null;
+      this.fullscreenShuffleButton = null;
+      this.fullscreenRepeatButton = null;
       this.fullscreenContainer = new FrameLayout(this);
       this.fullscreenContainer.setBackgroundColor(-16777216);
       this.setContentView(this.fullscreenContainer);
+      if (isAudio) {
+         this.fullscreenAmbient = new ImageView(this);
+         this.fullscreenAmbient.setScaleType(ScaleType.CENTER_CROP);
+         this.fullscreenAmbient.setAlpha(0.92F);
+         this.fullscreenContainer.addView(this.fullscreenAmbient, new FrameLayout.LayoutParams(-1, -1));
+         View scrim = new View(this);
+         scrim.setBackgroundColor(Color.argb(155, 7, 4, 11));
+         this.fullscreenContainer.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+      } else {
+         this.fullscreenAmbient = null;
+      }
       this.videoSurface = surface;
       this.fullscreenContainer.addView(this.videoSurface, new FrameLayout.LayoutParams(-1, -1));
-      if (!this.current.video) {
-         FrameLayout audioStage = this.createAudioArtworkStage(this.current, true);
-         this.fullscreenContainer.addView(audioStage, new FrameLayout.LayoutParams(this.dp(270), this.dp(280), Gravity.CENTER));
-      }
+      this.videoTapDetector = this.createVideoTapDetector();
       View touchLayer = new View(this);
       touchLayer.setBackgroundColor(0);
       touchLayer.setOnTouchListener((v, e) -> {
@@ -5231,21 +6128,17 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       this.fullscreenContainer.addView(touchLayer, new FrameLayout.LayoutParams(-1, -1));
       this.addGestureHuds(this.fullscreenContainer);
       if (this.current.network && playbackStartPending) this.addStreamLoadingOverlay(this.fullscreenContainer);
+      if (isAudio) {
       boolean portraitHeader = this.getResources().getConfiguration().orientation != Configuration.ORIENTATION_LANDSCAPE;
-      this.fullscreenTopOverlay = portraitHeader ? this.col() : this.row();
-      this.fullscreenTopOverlay.setPadding(this.dp(12.0F), this.dp(5.0F), this.dp(12.0F), this.dp(5.0F));
-      this.fullscreenTopOverlay.setBackground(this.shape(Color.argb(112, 12, 12, 12), 12));
-      this.fullscreenTitle = this.text(this.current.name, 12, -1, true);
-      this.fullscreenTitle.setSingleLine(!portraitHeader);
-      this.fullscreenTitle.setGravity(Gravity.CENTER_VERTICAL);
-      this.fullscreenTitle.setPadding(this.dp(6.0F), 0, this.dp(4.0F), 0);
-      LinearLayout titleRow = portraitHeader ? this.row() : this.fullscreenTopOverlay;
+      this.fullscreenTopOverlay = this.row();
+      this.fullscreenTopOverlay.setGravity(Gravity.CENTER_VERTICAL);
+      this.fullscreenTopOverlay.setPadding(this.dp(10.0F), this.dp(6.0F), this.dp(10.0F), this.dp(6.0F));
+      this.fullscreenTopOverlay.setBackground(this.shape(Color.argb(150, 24, 17, 38), 20));
       TextView playerBack = this.compactButton("‹", false);
-      titleRow.addView(playerBack);
+      this.fullscreenTopOverlay.addView(playerBack, this.lp(this.dp(46.0F), this.dp(46.0F)));
       playerBack.setOnClickListener((v) -> this.toggleFullscreen());
-      titleRow.addView(this.fullscreenTitle, new LinearLayout.LayoutParams(0, -2, 1.0F));
-      LinearLayout actionBar = portraitHeader ? this.row() : this.fullscreenTopOverlay;
-      if (portraitHeader) this.fullscreenTopOverlay.addView(titleRow, this.lp(-1, -2));
+      LinearLayout actionBar = this.row();
+      actionBar.setGravity(Gravity.CENTER);
       TextView audio = this.compactButton("♫", false);
       TextView subtitle = this.compactButton("CC", false);
       TextView ratio = this.compactButton("▣ " + this.aspectMode, false); this.landscapeRatioButton=ratio;
@@ -5262,6 +6155,7 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       bookmarkStream.setVisibility(this.current.network ? 0 : 8);
       subtitle.setVisibility(this.current.video ? 0 : 8);
       ratio.setVisibility(this.current.video ? 0 : 8);
+      pip.setVisibility(this.current.video ? 0 : 8);
       TextView[] var12 = new TextView[]{audio, subtitle, ratio, tools, playlist, search, bookmarkStream, pip, exit};
       int var13 = var12.length;
 
@@ -5298,6 +6192,75 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.toggleFullscreen();
       });
       pip.setOnClickListener(v -> this.enterPlayerPip());
+      HorizontalScrollView actionScroller = new HorizontalScrollView(this);
+      actionScroller.setHorizontalScrollBarEnabled(false);
+      actionScroller.setFillViewport(false);
+      actionScroller.setClipToPadding(false);
+      actionScroller.setPadding(this.dp(2), 0, this.dp(2), 0);
+      MediaRouteButton fullscreenCast = this.createCastButton();
+      LinearLayout.LayoutParams castLp = this.lp(this.dp(42.0F), this.dp(42.0F));
+      castLp.setMargins(this.dp(2), 0, this.dp(2), 0);
+      actionBar.addView(fullscreenCast, castLp);
+      actionScroller.addView(actionBar, new HorizontalScrollView.LayoutParams(-2, -2));
+      LinearLayout.LayoutParams actionScrollerLp = new LinearLayout.LayoutParams(0, -2, 1.0F);
+      actionScrollerLp.leftMargin = this.dp(6.0F);
+      this.fullscreenTopOverlay.addView(actionScroller, actionScrollerLp);
+      FrameLayout.LayoutParams topLp = new FrameLayout.LayoutParams(-1, -2, 48);
+      topLp.setMargins(this.dp(8.0F), this.dp(6.0F), this.dp(8.0F), 0);
+      this.fullscreenContainer.addView(this.fullscreenTopOverlay, topLp);
+      this.applyTranslucentControlBackgrounds(this.fullscreenTopOverlay, 165);
+      } else {
+      // Original video player top bar — unchanged.
+      boolean portraitHeader = this.getResources().getConfiguration().orientation != Configuration.ORIENTATION_LANDSCAPE;
+      this.fullscreenTopOverlay = portraitHeader ? this.col() : this.row();
+      this.fullscreenTopOverlay.setPadding(this.dp(12.0F), this.dp(5.0F), this.dp(12.0F), this.dp(5.0F));
+      this.fullscreenTopOverlay.setBackground(this.shape(Color.argb(112, 12, 12, 12), 12));
+      this.fullscreenTitle = this.text(this.current.name, 12, -1, true);
+      this.fullscreenTitle.setSingleLine(!portraitHeader);
+      this.fullscreenTitle.setGravity(Gravity.CENTER_VERTICAL);
+      this.fullscreenTitle.setPadding(this.dp(6.0F), 0, this.dp(4.0F), 0);
+      LinearLayout titleRow = portraitHeader ? this.row() : this.fullscreenTopOverlay;
+      TextView playerBack = this.compactButton("‹", false);
+      titleRow.addView(playerBack);
+      playerBack.setOnClickListener((v) -> this.toggleFullscreen());
+      titleRow.addView(this.fullscreenTitle, new LinearLayout.LayoutParams(0, -2, 1.0F));
+      LinearLayout actionBar = portraitHeader ? this.row() : this.fullscreenTopOverlay;
+      if (portraitHeader) this.fullscreenTopOverlay.addView(titleRow, this.lp(-1, -2));
+      TextView audio = this.compactButton("♫", false);
+      TextView subtitle = this.compactButton("CC", false);
+      TextView ratio = this.compactButton("▣ " + this.aspectMode, false); this.landscapeRatioButton=ratio;
+      this.bindAspectRatioControl(ratio);
+      TextView tools = this.compactButton("⋯", false);
+      TextView playlist = this.compactButton("☷", false);
+      TextView search = this.compactButton("⌕", false);
+      TextView bookmarkStream = this.compactButton("☆", false); bookmarkStream.setContentDescription("Bookmark stream");
+      TextView pip = this.compactButton("▣", false);
+      pip.setContentDescription("Open floating video window");
+      TextView exit = this.compactButton("×", false);
+      exit.setContentDescription("Close player");
+      search.setVisibility(this.current.network ? 0 : 8);
+      bookmarkStream.setVisibility(this.current.network ? 0 : 8);
+      subtitle.setVisibility(this.current.video ? 0 : 8);
+      ratio.setVisibility(this.current.video ? 0 : 8);
+      TextView[] var12 = new TextView[]{audio, subtitle, ratio, tools, playlist, search, bookmarkStream, pip, exit};
+
+      for(TextView option : var12) {
+         LinearLayout.LayoutParams optionLp = this.lp(-2, -2);
+         optionLp.setMargins(this.dp(2.0F), 0, this.dp(2.0F), 0);
+         actionBar.addView(option, optionLp);
+      }
+
+      audio.setOnClickListener((v) -> { this.showFullscreenControls(); this.showTracks(false); });
+      subtitle.setOnClickListener((v) -> { this.showFullscreenControls(); this.showTracks(true); });
+      tools.setOnClickListener((v) -> { this.showFullscreenTools(); });
+      playlist.setOnClickListener((v) -> { this.showFullscreenPlaylist(); });
+      search.setOnClickListener((v) -> {
+         this.showFullscreenPlaylist();
+         if (this.fullscreenChannelSearch != null) this.fullscreenChannelSearch.requestFocus();
+      });
+      bookmarkStream.setOnClickListener(v -> { this.editOrAddCurrentStreamBookmark(); this.showFullscreenControls(); });
+      exit.setOnClickListener((v) -> { this.toggleFullscreen(); });
+      pip.setOnClickListener(v -> this.enterPlayerPip());
       MediaRouteButton fullscreenCast = this.createCastButton();
       LinearLayout.LayoutParams castLp = this.lp(this.dp(42), this.dp(42));
       castLp.setMargins(this.dp(2), 0, this.dp(2), 0);
@@ -5309,25 +6272,34 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          actionScroller.addView(actionBar, new HorizontalScrollView.LayoutParams(-2, -2));
          this.fullscreenTopOverlay.addView(actionScroller, this.lp(-1, -2));
       }
-      FrameLayout.LayoutParams topLp = new FrameLayout.LayoutParams(-1, -2, 48);
-      topLp.setMargins(this.dp(6.0F), this.dp(5.0F), this.dp(6.0F), 0);
-      this.fullscreenContainer.addView(this.fullscreenTopOverlay, topLp);
+      FrameLayout.LayoutParams topLp2 = new FrameLayout.LayoutParams(-1, -2, 48);
+      topLp2.setMargins(this.dp(6.0F), this.dp(5.0F), this.dp(6.0F), 0);
+      this.fullscreenContainer.addView(this.fullscreenTopOverlay, topLp2);
       this.applyTranslucentControlBackgrounds(this.fullscreenTopOverlay, 170);
+      }
       this.fullscreenOverlay = this.col();
+      if (isAudio) {
+         boolean audioLandscape = this.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+         FrameLayout.LayoutParams audioPanelLp = new FrameLayout.LayoutParams(-1, -1);
+         audioPanelLp.setMargins(this.dp(6.0F), this.dp(audioLandscape ? 60.0F : 88.0F), this.dp(6.0F), this.dp(6.0F));
+         this.fullscreenContainer.addView(this.fullscreenOverlay, audioPanelLp);
+         this.buildAudioPlayerPanel();
+      } else {
+      // Original video player bottom bar — unchanged.
       this.fullscreenOverlay.setPadding(this.dp(12.0F), this.dp(5.0F), this.dp(12.0F), this.dp(7.0F));
       this.fullscreenOverlay.setBackground(this.shape(Color.argb(120, 10, 10, 10), 12));
       FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(-1, -2, 80);
       panelLp.setMargins(this.dp(6.0F), 0, this.dp(6.0F), this.dp(5.0F));
       this.fullscreenContainer.addView(this.fullscreenOverlay, panelLp);
-      this.fullscreenTime = this.text(this.clock(0L) + "  /  " + this.clock(this.player.getLength()), 10, -1, false);
+      this.fullscreenTime = this.text(this.playbackClock(0L, this.player.getLength()) + "  /  " + this.playbackClock(this.player.getLength(), this.player.getLength()), 10, -1, false);
       this.fullscreenTime.setGravity(17);
       this.fullscreenOverlay.addView(this.fullscreenTime);
-      this.fullscreenSeek = new SeekBar(this);
-      this.fullscreenSeek.setMax(1000);
-      this.fullscreenSeek.setProgressTintList(ColorStateList.valueOf(PURPLE));
-      this.fullscreenSeek.setThumbTintList(ColorStateList.valueOf(LILAC));
-      this.fullscreenOverlay.addView(this.fullscreenSeek, this.lp(-1, this.dp(24.0F)));
-      this.fullscreenSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar s){seeking=true;showFullscreenControls();}public void onStopTrackingTouch(SeekBar s){long length=activePlaybackLength();if(length>0){if(isCasting())seekBy(length*s.getProgress()/1000L-activePlaybackTime());else player.setTime(length*s.getProgress()/1000L);}seeking=false;showFullscreenControls();}public void onProgressChanged(SeekBar s,int p,boolean u){}});
+      this.fullscreenVideoSeek = new SeekBar(this);
+      this.fullscreenVideoSeek.setMax(1000);
+      this.fullscreenVideoSeek.setProgressTintList(ColorStateList.valueOf(PURPLE));
+      this.fullscreenVideoSeek.setThumbTintList(ColorStateList.valueOf(LILAC));
+      this.fullscreenOverlay.addView(this.fullscreenVideoSeek, this.lp(-1, this.dp(24.0F)));
+      this.fullscreenVideoSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar s){seeking=true;showFullscreenControls();}public void onStopTrackingTouch(SeekBar s){long length=activePlaybackLength();if(length>0){if(isCasting())seekBy(length*s.getProgress()/1000L-activePlaybackTime());else player.setTime(length*s.getProgress()/1000L);}seeking=false;showFullscreenControls();}public void onProgressChanged(SeekBar s,int p,boolean u){}});
       LinearLayout controls = this.row();
       controls.setGravity(17);
       TextView back10 = this.compactButton("↶ 10", false);
@@ -5344,10 +6316,8 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       orientationButton.setVisibility(this.current.video ? View.VISIBLE : View.GONE);
       orientationButton.setContentDescription("Orientation mode: " + this.orientationMode);
       TextView[] var24 = new TextView[]{orientationButton, back10, previous, play, next, forward10, speed, sleep};
-      int var25 = var24.length;
 
-      for(int var26 = 0; var26 < var25; ++var26) {
-         TextView b = var24[var26];
+      for(TextView b : var24) {
          LinearLayout.LayoutParams bp = this.lp(-2, -2);
          bp.setMargins(this.dp(2.0F), this.dp(2.0F), this.dp(2.0F), this.dp(2.0F));
          controls.addView(b, bp);
@@ -5387,11 +6357,12 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
          this.showSleepTimerDialog();
          this.showFullscreenControls();
       });
+      this.applyTranslucentControlBackgrounds(this.fullscreenOverlay, 170);
+      }
       this.fullscreenOverlay.setOnTouchListener((v, e) -> {
          this.showFullscreenControls();
          return false;
       });
-      this.applyTranslucentControlBackgrounds(this.fullscreenOverlay, 170);
       this.fullscreenTopOverlay.setVisibility(8);
       this.fullscreenOverlay.setVisibility(8);
       this.buildFullscreenDrawer();
@@ -5405,17 +6376,253 @@ public class MainActivity extends androidx.fragment.app.FragmentActivity {
       if (this.screenTouchesLocked && this.screenLockOverlay != null) this.screenLockOverlay.setVisibility(View.VISIBLE);
    }
 
+   /** Small pill-shaped transport button used by the player bottom bar. */
+   private TextView playerPill(String label, boolean active) {
+      TextView t = this.text(label, 12, active ? LILAC : -1, true);
+      t.setGravity(Gravity.CENTER);
+      t.setSingleLine(true);
+      t.setMinHeight(this.dp(44.0F));
+      t.setBackground(this.playerPillBackground(active));
+      return t;
+   }
+
+   private Drawable playerPillBackground(boolean active) {
+      return this.touchSurface(active ? PURPLE : Color.argb(96, 46, 30, 66), 14);
+   }
+
+   /** Large glowing play/pause button at the center of the player controls. */
+   private TextView playerPlayButton() {
+      TextView t = this.text("▶", 20, -1, true);
+      t.setGravity(Gravity.CENTER);
+      t.setSingleLine(true);
+      t.setMinWidth(this.dp(54.0F));
+      t.setMinHeight(this.dp(54.0F));
+      GradientDrawable ring = new GradientDrawable();
+      ring.setShape(GradientDrawable.OVAL);
+      ring.setColor(PURPLE);
+      ring.setStroke(this.dp(2), LILAC);
+      t.setBackground(ring);
+      return t;
+   }
+
+   /** Audio player matching the card design: a bordered panel with the ambient
+    * wave backdrop, inner header, artwork stage, centered title/artist, waveform
+    * seek and the 5-button control row — plus a volume slider and tools row
+    * below the card. */
+   private void buildAudioPlayerPanel() {
+      boolean landscape = this.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+      String artist = this.current.artist == null || this.current.artist.isEmpty() ? "Now Playing" : this.current.artist;
+
+      FrameLayout card = new FrameLayout(this);
+      card.setClipToOutline(true);
+      GradientDrawable cardBg = new GradientDrawable();
+      cardBg.setColor(Color.argb(110, 16, 9, 27));
+      cardBg.setCornerRadius(this.dp(26));
+      cardBg.setStroke(this.dp(1.5F), Color.argb(150, 207, 142, 255));
+      card.setBackground(cardBg);
+      this.audioWaveBackdrop = new com.soloplayer.android.ui.player.AudioWaveBackdropView(this, PURPLE, LILAC);
+      this.audioWaveBackdrop.setPlaying(this.isPlaybackActive());
+      card.addView(this.audioWaveBackdrop, new FrameLayout.LayoutParams(-1, -1));
+      LinearLayout cardContent = this.col();
+      cardContent.setPadding(this.dp(14), this.dp(10), this.dp(14), this.dp(14));
+      card.addView(cardContent, new FrameLayout.LayoutParams(-1, -1));
+
+      FrameLayout stage = this.createAudioArtworkStage(this.current, true, this.fullscreenAmbient);
+      if (!landscape) {
+         LinearLayout.LayoutParams stageLp = new LinearLayout.LayoutParams(-1, 0, 1.0F);
+         stageLp.topMargin = this.dp(6.0F);
+         cardContent.addView(stage, stageLp);
+         this.fullscreenTitle = this.text(this.current.name, 15, -1, true);
+         this.fullscreenTitle.setGravity(Gravity.CENTER);
+         this.fullscreenTitle.setMaxLines(2);
+         this.fullscreenTitle.setEllipsize(TextUtils.TruncateAt.END);
+         LinearLayout.LayoutParams titleLp = this.lp(-1, -2);
+         titleLp.topMargin = this.dp(4.0F);
+         cardContent.addView(this.fullscreenTitle, titleLp);
+         this.fullscreenArtist = this.text(artist, 12, LILAC, false);
+         this.fullscreenArtist.setGravity(Gravity.CENTER);
+         this.fullscreenArtist.setSingleLine(true);
+         this.fullscreenArtist.setEllipsize(TextUtils.TruncateAt.END);
+         cardContent.addView(this.fullscreenArtist, this.lp(-1, -2));
+         cardContent.addView(this.buildAudioSeekRow(), this.lp(-1, -2));
+         LinearLayout.LayoutParams ctlLp = this.lp(-1, -2);
+         ctlLp.topMargin = this.dp(2.0F);
+         cardContent.addView(this.buildAudioControlsRow(), ctlLp);
+      } else {
+         LinearLayout mid = this.row();
+         mid.setGravity(Gravity.CENTER_VERTICAL);
+         mid.addView(stage, this.lp(this.dp(210), this.dp(232)));
+         LinearLayout right = this.col();
+         right.setGravity(Gravity.CENTER_VERTICAL);
+         right.setPadding(this.dp(12.0F), 0, 0, 0);
+         this.fullscreenTitle = this.text(this.current.name, 15, -1, true);
+         this.fullscreenTitle.setMaxLines(2);
+         this.fullscreenTitle.setEllipsize(TextUtils.TruncateAt.END);
+         right.addView(this.fullscreenTitle, this.lp(-1, -2));
+         this.fullscreenArtist = this.text(artist, 12, LILAC, false);
+         this.fullscreenArtist.setSingleLine(true);
+         this.fullscreenArtist.setEllipsize(TextUtils.TruncateAt.END);
+         right.addView(this.fullscreenArtist, this.lp(-1, -2));
+         LinearLayout.LayoutParams seekLp = this.lp(-1, -2);
+         seekLp.topMargin = this.dp(8.0F);
+         right.addView(this.buildAudioSeekRow(), seekLp);
+         LinearLayout.LayoutParams ctlLp = this.lp(-1, -2);
+         ctlLp.topMargin = this.dp(6.0F);
+         right.addView(this.buildAudioControlsRow(), ctlLp);
+         mid.addView(right, new LinearLayout.LayoutParams(0, -2, 1.0F));
+         cardContent.addView(mid, this.lp(-1, -2));
+      }
+      this.fullscreenOverlay.addView(card, new LinearLayout.LayoutParams(-1, 0, 1.0F));
+
+      if (landscape) return;
+
+      LinearLayout vol = this.row();
+      vol.setGravity(Gravity.CENTER_VERTICAL);
+      TextView speaker = this.text("🔊", 13, LILAC, true);
+      vol.addView(speaker, this.lp(-2, -2));
+      SeekBar volSeek = new SeekBar(this);
+      final AudioManager am = (AudioManager)this.getSystemService("audio");
+      int maxVol = am == null ? 15 : am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+      volSeek.setMax(maxVol);
+      volSeek.setProgress(am == null ? maxVol : am.getStreamVolume(AudioManager.STREAM_MUSIC));
+      try {
+         volSeek.getProgressDrawable().setTint(LILAC);
+         volSeek.getThumb().setTint(LILAC);
+      } catch (Exception ignored) {}
+      volSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+         public void onProgressChanged(SeekBar b, int p, boolean fromUser) {
+            if (fromUser && am != null) am.setStreamVolume(AudioManager.STREAM_MUSIC, p, 0);
+         }
+         public void onStartTrackingTouch(SeekBar b) {}
+         public void onStopTrackingTouch(SeekBar b) {}
+      });
+      LinearLayout.LayoutParams volSeekLp = new LinearLayout.LayoutParams(0, -2, 1.0F);
+      volSeekLp.setMargins(this.dp(10.0F), 0, 0, 0);
+      vol.addView(volSeek, volSeekLp);
+      LinearLayout.LayoutParams volLp = this.lp(-1, -2);
+      volLp.setMargins(this.dp(12.0F), this.dp(10.0F), this.dp(12.0F), 0);
+      this.fullscreenOverlay.addView(vol, volLp);
+
+      FrameLayout bottomRow = new FrameLayout(this);
+      TextView more = this.text("⋯", 18, -1, true);
+      more.setGravity(Gravity.CENTER);
+      GradientDrawable circle = new GradientDrawable();
+      circle.setShape(GradientDrawable.OVAL);
+      circle.setColor(Color.argb(70, 30, 18, 44));
+      circle.setStroke(this.dp(1), LILAC);
+      more.setBackground(circle);
+      bottomRow.addView(more, new FrameLayout.LayoutParams(this.dp(46), this.dp(46), Gravity.CENTER));
+      more.setOnClickListener(v -> this.showFullscreenTools());
+      TextView sparkle = this.text("✦", 16, LILAC, true);
+      sparkle.setGravity(Gravity.CENTER);
+      bottomRow.addView(sparkle, new FrameLayout.LayoutParams(this.dp(46), this.dp(46), Gravity.RIGHT | Gravity.CENTER_VERTICAL));
+      sparkle.setOnClickListener(v -> this.showPlaybackPresets(false));
+      LinearLayout.LayoutParams bottomLp = this.lp(-1, this.dp(54));
+      bottomLp.setMargins(this.dp(8.0F), this.dp(2.0F), this.dp(8.0F), 0);
+      this.fullscreenOverlay.addView(bottomRow, bottomLp);
+   }
+
+   private LinearLayout buildAudioSeekRow() {
+      LinearLayout seekRow = this.row();
+      seekRow.setGravity(Gravity.CENTER_VERTICAL);
+      seekRow.setPadding(0, this.dp(8.0F), 0, 0);
+      this.fullscreenTime = this.text(this.playbackClock(0L, this.player.getLength()), 10, -1, true);
+      this.fullscreenDuration = this.text(this.playbackClock(this.player.getLength(), this.player.getLength()), 10, MUTED, false);
+      this.fullscreenSeek = new WaveformSeekView(this, PURPLE, LILAC);
+      this.fullscreenSeek.setSeed(this.current.uri);
+      seekRow.addView(this.fullscreenTime, this.lp(-2, -2));
+      LinearLayout.LayoutParams seekLp = new LinearLayout.LayoutParams(0, this.dp(30.0F), 1.0F);
+      seekLp.setMargins(this.dp(8.0F), 0, this.dp(8.0F), 0);
+      seekRow.addView(this.fullscreenSeek, seekLp);
+      seekRow.addView(this.fullscreenDuration, this.lp(-2, -2));
+      this.fullscreenSeek.setOnSeekListener(new WaveformSeekView.OnSeekListener() {
+         public void onStartTracking(WaveformSeekView s) { seeking = true; showFullscreenControls(); }
+         public void onProgressChanged(WaveformSeekView s, int p) {}
+         public void onStopTracking(WaveformSeekView s, int p) {
+            long length = activePlaybackLength();
+            if (length > 0L) {
+               if (isCasting()) seekBy(length * p / 1000L - activePlaybackTime());
+               else player.setTime(length * p / 1000L);
+            }
+            seeking = false;
+            showFullscreenControls();
+         }
+      });
+      return seekRow;
+   }
+
+   private String repeatGlyph() {
+      return this.repeatMode == 2 ? "↻¹" : "↻";
+   }
+
+   /** The 5-button row from the design: shuffle, previous, big play/pause,
+    * next, repeat. */
+   private LinearLayout buildAudioControlsRow() {
+      LinearLayout controls = this.row();
+      controls.setGravity(Gravity.CENTER);
+      TextView shuffle = this.text("⤨", 16, this.shuffleEnabled ? LILAC : -1, true);
+      shuffle.setGravity(Gravity.CENTER);
+      shuffle.setMinWidth(this.dp(52.0F));
+      shuffle.setMinHeight(this.dp(52.0F));
+      shuffle.setContentDescription("Shuffle");
+      this.fullscreenShuffleButton = shuffle;
+      TextView previous = this.text("|◀", 17, -1, true);
+      previous.setGravity(Gravity.CENTER);
+      previous.setMinWidth(this.dp(52.0F));
+      previous.setMinHeight(this.dp(52.0F));
+      TextView play = this.playerPlayButton();
+      play.setMinWidth(this.dp(64.0F));
+      play.setMinHeight(this.dp(64.0F));
+      this.fullscreenPlayButton = play;
+      this.setPlaybackButtonIcon(play, this.isPlaybackActive());
+      TextView next = this.text("▶|", 17, -1, true);
+      next.setGravity(Gravity.CENTER);
+      next.setMinWidth(this.dp(52.0F));
+      next.setMinHeight(this.dp(52.0F));
+      TextView repeat = this.text(this.repeatGlyph(), 16, this.repeatMode != 0 ? LILAC : -1, true);
+      repeat.setGravity(Gravity.CENTER);
+      repeat.setMinWidth(this.dp(52.0F));
+      repeat.setMinHeight(this.dp(52.0F));
+      repeat.setContentDescription("Repeat");
+      this.fullscreenRepeatButton = repeat;
+      TextView[] buttons = new TextView[]{shuffle, previous, play, next, repeat};
+      for (TextView b : buttons) {
+         LinearLayout.LayoutParams bp = this.lp(-2, -2);
+         bp.setMargins(this.dp(6.0F), 0, this.dp(6.0F), 0);
+         controls.addView(b, bp);
+      }
+      shuffle.setOnClickListener(v -> {
+         this.shuffleEnabled = !this.shuffleEnabled;
+         shuffle.setTextColor(this.shuffleEnabled ? LILAC : -1);
+         this.showFullscreenControls();
+      });
+      previous.setOnClickListener(v -> { this.playAdjacent(-1); this.showFullscreenControls(); });
+      play.setOnClickListener(v -> { this.togglePlayback(); this.showFullscreenControls(); });
+      next.setOnClickListener(v -> { this.playAdjacent(1); this.showFullscreenControls(); });
+      repeat.setOnClickListener(v -> {
+         this.repeatMode = (this.repeatMode + 1) % 3;
+         repeat.setText(this.repeatGlyph());
+         repeat.setTextColor(this.repeatMode != 0 ? LILAC : -1);
+         this.toast(this.repeatMode == 0 ? "Repeat off" : this.repeatMode == 1 ? "Repeat all" : "Repeat one");
+         this.showFullscreenControls();
+      });
+      return controls;
+   }
+
    private void addGestureHuds(FrameLayout host) {
       if (this.brightnessHud != null && this.brightnessHud.getParent() instanceof ViewGroup) ((ViewGroup)this.brightnessHud.getParent()).removeView(this.brightnessHud);
       if (this.volumeHud != null && this.volumeHud.getParent() instanceof ViewGroup) ((ViewGroup)this.volumeHud.getParent()).removeView(this.volumeHud);
+      boolean volumeOnLeft = !this.gestureSidesSwapped;
+      int volumeGravity = Gravity.CENTER_VERTICAL | (volumeOnLeft ? Gravity.LEFT : Gravity.RIGHT);
+      int brightnessGravity = Gravity.CENTER_VERTICAL | (volumeOnLeft ? Gravity.RIGHT : Gravity.LEFT);
       this.volumeHud = this.gestureHud("♫", false);
-      FrameLayout.LayoutParams vlp = new FrameLayout.LayoutParams(this.dp(70.0F), this.dp(190.0F), Gravity.CENTER_VERTICAL | Gravity.LEFT);
-      vlp.leftMargin = this.dp(12.0F);
+      FrameLayout.LayoutParams vlp = new FrameLayout.LayoutParams(this.dp(70.0F), this.dp(190.0F), volumeGravity);
+      if (volumeOnLeft) vlp.leftMargin = this.dp(12.0F); else vlp.rightMargin = this.dp(12.0F);
       host.addView(this.volumeHud, vlp);
       this.volumeHud.setVisibility(View.GONE);
       this.brightnessHud = this.gestureHud("☼", true);
-      FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(this.dp(70.0F), this.dp(190.0F), Gravity.CENTER_VERTICAL | Gravity.RIGHT);
-      blp.rightMargin = this.dp(12.0F);
+      FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(this.dp(70.0F), this.dp(190.0F), brightnessGravity);
+      if (volumeOnLeft) blp.rightMargin = this.dp(12.0F); else blp.leftMargin = this.dp(12.0F);
       host.addView(this.brightnessHud, blp);
       this.brightnessHud.setVisibility(View.GONE);
    }
@@ -5724,7 +6931,8 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
             if (this.touchZone != 0 && Math.abs(dy) > (float)this.dp(2.0F)) {
                this.touchMoved = true;
                change = dy / (float)Math.max(1, host.getHeight());
-               if (this.touchZone == 1) {
+                boolean adjustVolume = (this.touchZone == 1) != this.gestureSidesSwapped;
+                if (adjustVolume) {
                   this.gestureVolume = Math.max(0, Math.min(100, Math.round((float)this.touchStartVolume + change * 100.0F)));
                   this.setPlaybackVolumePercent(this.gestureVolume);
                   this.volumeValue.setText(this.gestureVolume + "%");
@@ -5735,7 +6943,7 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
                   int brightnessPercent = Math.max(1, Math.min(100, Math.round((this.touchStartBrightness + change) * 100.0F)));
                   this.setWindowBrightnessPercent(brightnessPercent);
                   this.brightnessValue.setText(brightnessPercent + "%");
-                  this.animateHudSlider(this.brightnessSlider, Math.round(this.gestureBrightness * 100.0F));
+                   this.animateHudSlider(this.brightnessSlider, brightnessPercent);
                   this.showGestureHud(this.brightnessHud);
                   this.volumeHud.setVisibility(8);
                }
@@ -5764,9 +6972,15 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
       FrameLayout.LayoutParams all = new FrameLayout.LayoutParams(-1, -1);
       this.fullscreenContainer.addView(this.fullscreenDrawer, all);
       LinearLayout pane = this.col();
-      pane.setPadding(this.dp(10.0F), this.dp(10.0F), this.dp(10.0F), this.dp(10.0F));
-      pane.setBackgroundColor(PANEL);
-      FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(this.dp(290.0F), -1, 5);
+      pane.setPadding(this.dp(12.0F), this.dp(12.0F), this.dp(12.0F), this.dp(10.0F));
+      float paneRadius = this.dp(20.0F);
+      GradientDrawable paneBg = new GradientDrawable();
+      paneBg.setColor(PANEL);
+      paneBg.setCornerRadii(new float[]{paneRadius, paneRadius, paneRadius, paneRadius, 0, 0, 0, 0});
+      pane.setBackground(paneBg);
+      boolean portrait = this.getResources().getConfiguration().orientation != Configuration.ORIENTATION_LANDSCAPE;
+      int paneHeight = (int)(this.getResources().getDisplayMetrics().heightPixels * (portrait ? 0.55F : 0.65F));
+      FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(-1, paneHeight, 80);
       this.fullscreenDrawer.addView(pane, pp);
       pane.setOnClickListener((v) -> {
       });
@@ -5902,11 +7116,19 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
    private LinearLayout fullscreenToolRow(String label, String value, Runnable action) {
       LinearLayout r = this.col();
       r.setPadding(this.dp(12.0F), this.dp(11.0F), this.dp(12.0F), this.dp(11.0F));
-      r.setBackground(this.shape(CARD, 12));
-      r.addView(this.text(label, 13, -1, true));
+      r.setBackground(this.touchSurface(CARD, 12));
+      r.setMinimumHeight(this.dp(58));
+      TextView title = this.text(label, 13, Color.WHITE, true);
+      title.setMaxLines(2);
+      title.setEllipsize(TextUtils.TruncateAt.END);
+      r.addView(title);
       TextView sub = this.text(value, 10, MUTED, false);
+      sub.setMaxLines(2);
+      sub.setEllipsize(TextUtils.TruncateAt.END);
       sub.setPadding(0, this.dp(3.0F), 0, 0);
       r.addView(sub);
+      r.setClickable(true);
+      r.setFocusable(true);
       r.setOnClickListener((v) -> {
          action.run();
       });
@@ -5966,6 +7188,7 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
 
    private void togglePlayerControls() {
       if (this.fullscreen) {
+         if (!this.currentIsVideo()) { this.showFullscreenControls(); return; }
          boolean visible = this.fullscreenOverlay != null && this.fullscreenOverlay.getVisibility() == View.VISIBLE;
          if (visible) this.hideFullscreenControlsNow(); else this.showFullscreenControls();
       } else {
@@ -6019,7 +7242,7 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
          }
 
          this.handler.removeCallbacks(this.hideFullscreenControls);
-         this.handler.postDelayed(this.hideFullscreenControls, 4000L);
+         if (this.currentIsVideo()) this.handler.postDelayed(this.hideFullscreenControls, 4000L);
       }
    }
 
@@ -6086,6 +7309,15 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
          this.toast("This channel has no playable stream URL");
          return;
       }
+      if (item.uri.startsWith("ytm:")) {
+         String key = this.onlineVideoId(item);
+         String cached = this.onlineResolvedUrls.get(key);
+         if (cached == null || !this.resolvedOnlineFileExists(cached)) {
+            this.onlineResolvedUrls.remove(key);
+            this.resolveOnlineItem(item);
+            return;
+         }
+      }
       if (this.player == null || this.vlc == null) {
          this.toast("The media player is not ready. Please try again.");
          return;
@@ -6113,7 +7345,13 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
             this.activeMediaFd = null;
          }
 
-         Uri source = Uri.parse(item.uri);
+         String playableUri = item.uri;
+         if (playableUri.startsWith("ytm:")) {
+            String resolved = this.onlineResolvedUrls.get(this.onlineVideoId(item));
+            if (resolved == null) throw new IOException("Online track has not been resolved yet");
+            playableUri = resolved;
+         }
+         Uri source = Uri.parse(playableUri);
          Media media;
          if ("content".equalsIgnoreCase(source.getScheme()) && !item.network) {
             this.activeMediaFd = this.getContentResolver().openAssetFileDescriptor(source, "r");
@@ -6129,7 +7367,7 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
          media.setHWDecoderEnabled(this.decoderMode != 1, this.decoderMode == 2);
          if (item.video && item.uri.equals(externalSubtitleMediaUri) && !externalSubtitlePath.isEmpty()) media.addOption(":sub-file=" + externalSubtitlePath);
          media.addOption(":network-caching=" + this.networkCache);
-         if (item.network) {
+         if (item.network || !item.tvgId.isEmpty()) {
             if (!item.agent.isEmpty()) {
                media.addOption(":http-user-agent=" + this.clean(item.agent));
             }
@@ -6163,11 +7401,32 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
             playbackStartPending = false;
          }
 
+         boolean builtForVideo = this.fullscreenArtwork == null;
+         if (this.fullscreen && builtForVideo != item.video) {
+            try { this.player.detachViews(); this.videoSurfaceAttached = false; } catch (Exception ignored) {}
+            if (this.videoSurface != null && this.videoSurface.getParent() instanceof ViewGroup) ((ViewGroup)this.videoSurface.getParent()).removeView(this.videoSurface);
+            this.buildLandscapePlayerUi(this.videoSurface);
+            if (item.video) this.attachVideoSurface(this.videoSurface, true, 0);
+            this.showFullscreenControls();
+         }
          this.applyAspectRatio();
          if (this.fullscreenTitle != null) {
             this.fullscreenTitle.setText(item.name);
          }
-         if (!item.video && this.fullscreenArtwork != null) this.loadArtwork(item, this.fullscreenArtwork);
+         if (this.fullscreenArtist != null) {
+            String artist = item.artist == null || item.artist.isEmpty()
+                  ? (item.video ? "Now Playing (Video)" : "Now Playing") : item.artist;
+            this.fullscreenArtist.setText(artist);
+         }
+         if (this.fullscreenHeaderTitle != null) {
+            this.fullscreenHeaderTitle.setText(item.name);
+         }
+         if (this.fullscreenHeaderArtist != null) {
+            String artist = item.artist == null || item.artist.isEmpty() ? "Now Playing" : item.artist;
+            this.fullscreenHeaderArtist.setText(artist);
+         }
+         if (!item.video && this.fullscreenArtwork != null) this.loadArtwork(item, this.fullscreenArtwork, this.fullscreenAmbient);
+         if (this.fullscreenSeek != null) this.fullscreenSeek.setSeed(item.uri);
 
          this.refreshFullscreenQueue();
          this.syncPlaybackUi();
@@ -6193,6 +7452,11 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
       }
 
       if (!preserveAudio) this.stopPlaybackSession();
+      this.unregisterBecomingNoisyReceiver();
+      if (this.mediaSession != null) {
+         try { this.mediaSession.setActive(false); this.mediaSession.release(); } catch (Exception ignored) {}
+         this.mediaSession = null;
+      }
       if (activeActivity == this) activeActivity = null;
       if (!this.isCasting()) this.stopLocalCastServer();
       if (!(VERSION.SDK_INT >= 26 && this.isInPictureInPictureMode())) this.deleteActiveVaultTemp();
@@ -6205,6 +7469,7 @@ private boolean handleVideoTouch(MotionEvent e, FrameLayout host) {
       }
 
       this.thumbnailWorker.shutdownNow();
+      this.onlineWorker.shutdownNow();
       if (!preserveAudio && activeMediaFd != null) {
          try { activeMediaFd.close(); } catch (Exception ignored) {}
          activeMediaFd = null;
